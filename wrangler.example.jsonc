@@ -1,0 +1,94 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "clopinette-ai",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-03-24",
+  "compatibility_flags": ["nodejs_compat"],
+
+  // ─── Workers AI ───
+  // Enables @cf/ model access (Kimi K2.5, Granite, etc.)
+  "ai": { "binding": "AI" },
+
+  // ─── Browser Rendering ───
+  // Required for the web_browse tool and Playwright MCP
+  // Enable in CF dashboard: Workers & Pages → Browser Rendering
+  "browser": { "binding": "BROWSER" },
+
+  // ─── Durable Objects ───
+  // ClopinetteAgent: the AI agent with SQLite storage (sessions, memory, skills)
+  // PlaywrightMCP: headless browser automation via MCP protocol
+  "durable_objects": {
+    "bindings": [
+      { "name": "CLOPINETTE_AGENT", "class_name": "ClopinetteAgent" },
+      { "name": "PlaywrightMCP", "class_name": "PlaywrightMCP" }
+    ]
+  },
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["ClopinetteAgent"] },
+    { "tag": "v2", "new_sqlite_classes": ["PlaywrightMCP"] }
+  ],
+
+  // ─── R2 Buckets ───
+  // Create before deploying:
+  //   wrangler r2 bucket create clopinette-memories
+  //   wrangler r2 bucket create clopinette-skills
+  "r2_buckets": [
+    { "binding": "MEMORIES", "bucket_name": "clopinette-memories" },
+    { "binding": "SKILLS", "bucket_name": "clopinette-skills" }
+  ],
+
+  // ─── KV ───
+  // Platform identity links (Telegram chatId -> userId) and bot config.
+  // Create: wrangler kv namespace create LINKS
+  "kv_namespaces": [
+    { "binding": "LINKS", "id": "REPLACE_WITH_KV_ID" }
+  ],
+
+  // ─── Dynamic Workers (optional) ───
+  // Enables codemode: the LLM writes JS code instead of individual tool calls
+  // Requires Workers Paid plan. Remove this section to use regular tools.
+  "worker_loaders": [{ "binding": "LOADER" }],
+
+  // Codemode outbound: SSRF-safe fetch proxy for sandbox code.
+  // Deploy workers/outbound/ first, then uncomment:
+  // "services": [{ "binding": "CODEMODE_OUTBOUND", "service": "clopinette-outbound" }],
+
+  // ─── Env vars ───
+  "vars": {
+    // Comma-separated list of allowed CORS origins
+    // localhost is always allowed for local dev
+    "CORS_ORIGINS": "https://your-frontend.pages.dev"
+  },
+
+  // ─── Observability ───
+  "observability": { "enabled": true, "head_sampling_rate": 1 }
+
+  // ─── Secrets ───
+  // Set each via: wrangler secret put <NAME>
+  //
+  // Required:
+  //   MASTER_KEY          — AES-256 key for BYOK API key encryption
+  //                         Generate: openssl rand -base64 32
+  //
+  //   CF_ACCOUNT_ID       — Your Cloudflare account ID
+  //                         Find it: dashboard URL or `wrangler whoami`
+  //
+  //   CF_GATEWAY_ID       — AI Gateway ID for provider proxying
+  //                         Create: Dashboard → AI → Gateway
+  //
+  //   WS_SIGNING_SECRET   — HMAC secret shared with your gateway for
+  //                         ephemeral WebSocket token verification
+  //                         Generate: openssl rand -base64 32
+  //
+  // Optional:
+  //   BRAVE_API_KEY       — Brave Search API key (web_search tool)
+  //                         Free tier: 2000 queries/month
+  //                         Get one: https://brave.com/search/api/
+  //
+  //   CF_BROWSER_TOKEN    — Browser Rendering API token (web_browse tool)
+  //                         Create: Dashboard → Workers & Pages → Browser Rendering
+  //
+  //   API_AUTH_KEY         — Static bearer token fallback
+  //                         Used for service-to-service calls when
+  //                         WS_SIGNING_SECRET is not set
+}
