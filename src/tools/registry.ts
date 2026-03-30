@@ -31,6 +31,7 @@ export interface ToolContext {
   cfAccountId: string;
   cfBrowserToken?: string;
   searxngUrl?: string;
+  tavilyApiKey?: string;
   braveApiKey?: string;
   loader?: WorkerLoader;
   globalOutbound?: Fetcher;
@@ -58,7 +59,7 @@ export function buildTools(ctx: ToolContext) {
   const historyTool = createSessionSearchTool(ctx);
   const docsTool = createDocsTool(ctx);
   const notesTool = createNoteTool(ctx);
-  const webTool = createWebTool(ctx.cfAccountId, ctx.cfBrowserToken, ctx.ai, ctx.searxngUrl, ctx.braveApiKey);
+  const webTool = createWebTool(ctx.cfAccountId, ctx.cfBrowserToken, ctx.ai, ctx.searxngUrl, ctx.braveApiKey, ctx.tavilyApiKey);
   const ttsTool = createTtsTool(ctx.ai, ctx.r2Memories, ctx.userId, createUsageTracker(ctx));
   const imageTool = createImageGenTool(ctx.ai, ctx.r2Memories, ctx.userId, createUsageTracker(ctx));
 

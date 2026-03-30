@@ -518,6 +518,7 @@ export async function runPipeline(
     cfAccountId: ctx.env.CF_ACCOUNT_ID,
     cfBrowserToken: ctx.env.CF_BROWSER_TOKEN,
     searxngUrl: ctx.env.SEARXNG_URL,
+    tavilyApiKey: ctx.env.TAVILY_API_KEY,
     braveApiKey: ctx.env.BRAVE_API_KEY,
     loader: codemodeEnabled ? ctx.env.LOADER : undefined,
     globalOutbound: codemodeEnabled ? ctx.env.CODEMODE_OUTBOUND : undefined,

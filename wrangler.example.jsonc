@@ -81,6 +81,10 @@
   //                         Generate: openssl rand -base64 32
   //
   // Optional:
+  //   TAVILY_API_KEY      — Tavily Search API key (web search, LLM-optimized)
+  //                         Free tier: 1000 credits/month
+  //                         Get one: https://app.tavily.com
+  //
   //   BRAVE_API_KEY       — Brave Search API key (web_search tool)
   //                         Free tier: 2000 queries/month
   //                         Get one: https://brave.com/search/api/

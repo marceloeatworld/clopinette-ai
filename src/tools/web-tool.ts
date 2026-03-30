@@ -96,6 +96,41 @@ async function searchSearXNG(
   }
 }
 
+// ─── Tavily Search API (~400ms, 1000 free credits/month) ─────────────────────
+
+async function searchTavily(
+  apiKey: string, query: string, count: number,
+): Promise<SearchReturn | null> {
+  const t0 = Date.now();
+  try {
+    const resp = await fetch("https://api.tavily.com/search", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        api_key: apiKey,
+        query,
+        max_results: count,
+        search_depth: "basic",
+        include_answer: false,
+      }),
+    });
+    if (!resp.ok) {
+      console.warn(`[web] tavily failed: ${resp.status} (${Date.now() - t0}ms)`);
+      return null;
+    }
+    const data = await resp.json<{ results?: Array<{ title: string; url: string; content?: string }> }>();
+    const results: SearchResult[] = (data.results ?? []).slice(0, count).map(r => ({
+      title: r.title, url: r.url, description: r.content ?? "",
+    }));
+    console.log(`[web] tavily: ${results.length} results (${Date.now() - t0}ms)`);
+    if (results.length === 0) return null;
+    return { ok: true, engine: "tavily", query, results, count: results.length };
+  } catch (err) {
+    console.error(`[web] tavily error (${Date.now() - t0}ms):`, err);
+    return null;
+  }
+}
+
 // ─── Brave Search API (free tier 2000/month, ~300ms) ────────────────────────
 
 async function searchBraveAPI(
@@ -196,6 +231,7 @@ export function createWebTool(
   ai?: Ai,
   searxngUrl?: string,
   braveApiKey?: string,
+  tavilyApiKey?: string,
 ) {
   // Stable session ID — reuses the same Chromium instance across calls (3-5s vs 30s cold start)
   const sessionId = `clop-${accountId.slice(0, 12)}`;
@@ -269,7 +305,7 @@ export function createWebTool(
       console.log(`[web] action=${params.action} query=${params.query ?? ""} url=${params.url ?? ""} engine=${params.engine ?? "auto"}`);
 
       switch (params.action) {
-        // ─── SEARCH (SearXNG → Brave API → Browser Rendering fallback) ─
+        // ─── SEARCH (SearXNG → Tavily → Brave API → Browser Rendering fallback) ─
         case "search": {
           if (!params.query) return { ok: false, error: "query required for search" };
           const numResults = Math.min(params.count ?? 5, 10);
@@ -280,19 +316,25 @@ export function createWebTool(
             if (sx) return sx;
           }
 
-          // 2. Brave Search API (free tier, ~300ms, 2000/month)
+          // 2. Tavily Search API (1000 free credits/month, ~400ms)
+          if (tavilyApiKey) {
+            const tavily = await searchTavily(tavilyApiKey, params.query, numResults);
+            if (tavily) return tavily;
+          }
+
+          // 3. Brave Search API (free tier, ~300ms, 2000/month)
           if (braveApiKey) {
             const brave = await searchBraveAPI(braveApiKey, params.query, numResults);
             if (brave) return brave;
           }
 
-          // 3. Browser Rendering /scrape (last resort, ~3-5s with session reuse)
+          // 4. Browser Rendering /scrape (last resort, ~3-5s with session reuse)
           if (browserToken) {
             const scrape = await searchViaScrape(accountId, headers, params.query, numResults, "brave", sessionId);
             if (scrape) return scrape;
           }
 
-          return { ok: false, error: `No results for "${params.query}". Configure SEARXNG_URL or BRAVE_API_KEY for fast search.` };
+          return { ok: false, error: `No results for "${params.query}". Configure SEARXNG_URL, TAVILY_API_KEY, or BRAVE_API_KEY for fast search.` };
         }
 
         // ─── READ (URL → Markdown) ────────────────────────────────────────

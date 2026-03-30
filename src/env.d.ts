@@ -38,7 +38,8 @@ interface Env {
   CF_BROWSER_TOKEN?: string;
   API_AUTH_KEY?: string;
   GITHUB_TOKEN?: string;
-  // Search backends (SearXNG primary, Brave API fallback, Browser Rendering last resort)
+  // Search backends (SearXNG primary, Tavily, Brave API fallback, Browser Rendering last resort)
   SEARXNG_URL?: string;
+  TAVILY_API_KEY?: string;
   BRAVE_API_KEY?: string;
 }
