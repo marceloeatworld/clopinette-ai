@@ -146,6 +146,7 @@ describe("tool registry", () => {
       expect(codemodeTool._wrappedToolNames).not.toContain("calendar");
       expect(codemodeTool._wrappedToolNames).not.toContain("web");
       expect(codemodeTool._wrappedToolNames).not.toContain("docs");
+      expect(codemodeTool._wrappedToolNames).not.toContain("delegate");
       // Should contain core orchestration tools
       expect(codemodeTool._wrappedToolNames).toContain("memory");
       expect(codemodeTool._wrappedToolNames).toContain("history");

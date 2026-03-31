@@ -14,6 +14,7 @@ import { createTtsTool } from "./tts-tool.js";
 import { createImageGenTool } from "./image-gen-tool.js";
 import { createNoteTool } from "./note-tool.js";
 import { createCalendarTool } from "./calendar-tool.js";
+import { createDelegateTool } from "./delegate-tool.js";
 import { trackAuxiliaryUsage, type BackgroundTask } from "../pipeline.js";
 
 /**
@@ -76,6 +77,7 @@ export function buildTools(ctx: ToolContext) {
     image: imageTool,
     clarify: createClarifyTool(),
     ...(ctx.playwrightMcp ? { browser: createBrowserTool(ctx) } : {}),
+    ...((ctx.env as Env).DELEGATE_WORKER ? { delegate: createDelegateTool(ctx) } : {}),
 
     // ── Backward-compat aliases (old names → new tools) ─────────────────
     session_search: historyTool,
@@ -119,6 +121,7 @@ export function resolveTools(ctx: ToolContext) {
     image, tts, clarify,                 // media/UX actions — must be direct
     notes, note, save_note,              // user-facing side effects — must be direct
     calendar,                            // user-facing side effects — must be direct
+    delegate,                             // delegation — must be direct (not in sandbox)
     // All backward-compat aliases — strip from codemode namespace
     session_search, text_to_speech, image_generate,
     web_search, web_browse, web_crawl, docs_search, ai_search,
@@ -141,6 +144,7 @@ export function resolveTools(ctx: ToolContext) {
     clarify,
     notes,
     calendar,
+    ...(delegate ? { delegate } : {}),
   };
 }
 

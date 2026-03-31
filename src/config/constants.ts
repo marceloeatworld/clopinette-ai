@@ -50,6 +50,15 @@ Style:
 - Max 1 emoji per reply, only when it fits naturally. Zero is fine.
 - Never start with "Great question!", "Of course!", "Absolutely!" or any filler.`;
 
+export const TOOL_USE_ENFORCEMENT = `## Tool-use enforcement
+You MUST use your tools to take action — do not describe what you would do or plan to do without actually doing it.
+When you say you will perform an action (e.g. "I will search for...", "Let me check..."), you MUST immediately make the corresponding tool call in the same response.
+Never end your turn with a promise of future action — execute it now.
+Keep working until the task is actually complete. Do not stop with a summary of what you plan to do next.
+Every response should either (a) contain tool calls that make progress, or (b) deliver a final result to the user.`;
+
+export const SESSION_SEARCH_GUIDANCE = `When the user references something from a past conversation or you suspect relevant cross-session context exists, use the history tool to recall it before asking them to repeat themselves.`;
+
 export const MEMORY_GUIDANCE = `## Memory System
 You have a 5-layer memory system:
 - Layer 1 (Prompt Memory): MEMORY.md and USER.md — persistent notes about the world and the user.
@@ -88,6 +97,36 @@ Available functions on \`codemode\`: memory, history, skills, todo.
 Each function takes the same parameters as the corresponding tool.
 Use code when you need to combine multiple memory/history operations, loop, or branch.
 Note: web, docs, image, tts, notes, calendar, clarify are called directly, NOT via codemode.`;
+
+// ───────────────────────── Delegation ─────────────────────────
+
+export const DELEGATE_MAX_DEPTH = 2;
+export const DELEGATE_MAX_BATCH = 3;
+export const DELEGATE_MAX_STEPS = 3;
+/** Design intent: tools excluded from delegate sub-agents. Enforced by DelegateWorker's minimal tool set. */
+export const DELEGATE_BLOCKED_TOOLS = new Set([
+  "delegate", "mixture_of_agents", "clarify",
+  "memory", "calendar", "tts", "image", "notes",
+]);
+
+export const DELEGATION_GUIDANCE = `## Delegation
+You can delegate independent research tasks to sub-agents via the \`delegate\` tool.
+- Single task: delegate({ goal: "...", context: "..." })
+- Parallel batch: delegate({ tasks: [{ goal: "..." }, { goal: "..." }] })
+Sub-agents have web search and browser. They cannot write to your memory.
+Use delegation when:
+- You need to research 2-3 independent topics in parallel
+- A task requires deep web research that would exhaust your tool budget
+Do NOT delegate simple lookups — use web directly.
+
+AFTER delegation — the delegate results ARE your research:
+- Synthesize delegate summaries directly into your final answer.
+- Do NOT re-search the same topics with the web tool.
+- Only use web after delegation if a delegate explicitly could not find something.
+
+`;
+
+// ───────────────────────── Platform hints ─────────────────────────
 
 export const PLATFORM_HINTS: Record<Platform, string> = {
   websocket: "User is chatting via the web dashboard. Markdown is fully supported.",

@@ -115,6 +115,18 @@ export interface ConfigEntry {
   updated_at: string;
 }
 
+// ───────────────────────── Delegation types ─────────────────────────
+
+export interface DelegateResult {
+  status: "success" | "error";
+  summary: string;
+  toolTrace: string[];
+  duration: number;
+  tokens: { input: number; output: number };
+}
+
+// ───────────────────────── Hub types ────────────────────────────────
+
 export interface HubInstalledEntry {
   name: string;
   source: string;

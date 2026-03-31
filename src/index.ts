@@ -15,6 +15,7 @@ let cachedBotSecret: string | null = null;
 // Re-export DO classes for wrangler discovery
 export { ClopinetteAgent } from "./agent.js";
 export { PlaywrightMCP } from "./playwright-mcp.js";
+export { DelegateWorker } from "./delegate-worker.js";
 
 type HonoEnv = { Bindings: Env };
 const app = new Hono<HonoEnv>();

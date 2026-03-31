@@ -15,6 +15,8 @@ interface Env {
   // Gateway URL for usage reporting (fire-and-forget after each response)
   GATEWAY_URL?: string;
   GATEWAY_INTERNAL_KEY?: string;
+  // Delegation — ephemeral sub-agent DOs for parallel task execution
+  DELEGATE_WORKER?: DurableObjectNamespace;
   // Dynamic Workers (codemode) — opt-in, requires Workers Paid plan
   LOADER?: WorkerLoader;
   // Codemode outbound — SSRF-safe fetch proxy for sandbox code (service binding)
