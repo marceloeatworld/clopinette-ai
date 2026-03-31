@@ -1,6 +1,6 @@
 import { generateText } from "ai";
 import { createWorkersAI } from "workers-ai-provider";
-import { AUXILIARY_MODEL, MEMORY_CHAR_LIMIT, USER_CHAR_LIMIT } from "../config/constants.js";
+import { DEFAULT_MODEL, MEMORY_CHAR_LIMIT, USER_CHAR_LIMIT } from "../config/constants.js";
 import { getPromptMemory, updatePromptMemory } from "./prompt-memory.js";
 import { createSkill, searchSkills, editSkill } from "./skills.js";
 import { logAudit } from "../enterprise/audit.js";
@@ -207,7 +207,7 @@ export async function runSelfLearningReview(
   try {
     const workersai = createWorkersAI({ binding: ai });
     const response = await generateText({
-      model: workersai(AUXILIARY_MODEL),
+      model: workersai(DEFAULT_MODEL),
       system: "You are a self-learning review agent. Analyze the conversation and output JSON only.",
       prompt: `Conversation to review:\n\n${conversationSummary}\n\n---\n\n${prompt}`,
       maxRetries: 1,

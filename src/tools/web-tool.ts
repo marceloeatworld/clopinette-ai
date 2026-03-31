@@ -1,7 +1,7 @@
 import { z } from "zod";
 import { generateText } from "ai";
 import { createWorkersAI } from "workers-ai-provider";
-import { AUXILIARY_MODEL } from "../config/constants.js";
+import { DEFAULT_MODEL } from "../config/constants.js";
 
 /**
  * Unified web tool — 100% Cloudflare-native.
@@ -28,15 +28,17 @@ const SESSION_KEEP_ALIVE = 90_000;
 
 // ─── Summarization constants ──────────────────────────────────────────────────
 
-const SUMMARIZE_SYSTEM = `You are an expert content analyst. Extract the key information from this web page and create a comprehensive yet concise markdown summary.
+const SUMMARIZE_SYSTEM = `You are an expert content analyst. Create a comprehensive yet concise markdown summary of this web page.
 
-Include:
-1. Key facts, figures, data points, and actionable information
-2. Important quotes or code snippets in their original format
-3. Proper markdown formatting (headers, bullets, emphasis)
+Preserve ALL important information:
+- Key facts, figures, data points, and actionable information
+- Important quotes and code snippets in their original format
+- Specific names, dates, numbers, prices, versions
+- URLs and references that the reader might need
 
-Preserve ALL important information while removing boilerplate (navbars, footers, ads, cookie notices).
-Never lose key facts or insights. Be thorough but concise. Max 1200 words.`;
+Remove boilerplate (navbars, footers, ads, cookie notices, related articles).
+Use proper markdown formatting (headers, bullets, emphasis).
+Never lose key facts or insights — thoroughness over brevity. Max 1200 words.`;
 
 const CHUNK_SYSTEM = `You are processing a SECTION of a larger web page. Extract ALL key facts, figures, data, and insights from THIS SECTION ONLY.
 - Use bullet points and structured formatting
@@ -50,6 +52,33 @@ const CHUNK_THRESHOLD = 200_000;
 const CHUNK_SIZE = 50_000;
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
+
+/** Drain response body to prevent Cloudflare Worker deadlock on unconsumed responses. */
+async function drainResponse(resp: Response): Promise<void> {
+  try { await resp.arrayBuffer(); } catch { /* already consumed or errored */ }
+}
+
+/**
+ * Per-tool-instance concurrency limiter.
+ * Prevents Cloudflare "stalled HTTP response" deadlocks when the LLM
+ * emits multiple web tool calls in the same step (4+ concurrent fetches).
+ */
+function createSemaphore(max: number) {
+  let active = 0;
+  const queue: Array<() => void> = [];
+  return {
+    async acquire(): Promise<void> {
+      if (active < max) { active++; return; }
+      await new Promise<void>((resolve) => queue.push(resolve));
+      active++;
+    },
+    release(): void {
+      active--;
+      const next = queue.shift();
+      if (next) next();
+    },
+  };
+}
 
 function brBody(url: string, sessionId: string, extra?: Record<string, unknown>) {
   return {
@@ -80,6 +109,7 @@ async function searchSearXNG(
     const url = `${searxngUrl.replace(/\/$/, "")}/search?q=${encodeURIComponent(query)}&format=json&categories=general`;
     const resp = await fetch(url, { headers: { Accept: "application/json" } });
     if (!resp.ok) {
+      await drainResponse(resp);
       console.warn(`[web] searxng failed: ${resp.status} (${Date.now() - t0}ms)`);
       return null;
     }
@@ -106,6 +136,7 @@ async function searchBraveAPI(
     const url = `https://api.search.brave.com/res/v1/web/search?q=${encodeURIComponent(query)}&count=${count}`;
     const resp = await fetch(url, { headers: { "X-Subscription-Token": apiKey, Accept: "application/json" } });
     if (!resp.ok) {
+      await drainResponse(resp);
       console.warn(`[web] brave-api failed: ${resp.status} (${Date.now() - t0}ms)`);
       return null;
     }
@@ -157,6 +188,7 @@ async function searchViaScrape(
       }),
     });
     if (!resp.ok) {
+      await drainResponse(resp);
       console.warn(`[web] ${engine} scrape failed: ${resp.status} (${Date.now() - t0}ms)`);
       return null;
     }
@@ -197,23 +229,25 @@ export function createWebTool(
   searxngUrl?: string,
   braveApiKey?: string,
 ) {
-  // Stable session ID — reuses the same Chromium instance across calls (3-5s vs 30s cold start)
-  const sessionId = `clop-${accountId.slice(0, 12)}`;
+  // Unique session ID per tool instance — prevents Browser Rendering deadlock when
+  // delegates + parent share the same accountId but need separate Chromium sessions.
+  const sessionId = `clop-${accountId.slice(0, 8)}-${Math.random().toString(36).slice(2, 8)}`;
+
+  // Max 2 concurrent executions per tool instance — prevents "stalled HTTP response"
+  // deadlocks when the LLM emits 4+ web tool calls in the same step.
+  const sem = createSemaphore(2);
 
   return {
     description:
-      "All-in-one web tool: search the web, read URLs, extract data, scrape elements, list links, crawl sites.\n\n" +
+      "Web tool: search the web and read URLs. Also supports structured extraction, scraping, and crawling.\n\n" +
       "Actions:\n" +
-      "- 'search': search the web (fast — auto fallback chain).\n" +
-      "  USE for weather, news, prices, facts, any real-world question.\n" +
-      "- 'read': read a URL as markdown (auto-summarized for long pages).\n" +
-      "- 'extract': AI-powered structured data extraction from a URL (pass prompt and/or schema).\n" +
+      "- 'search': search the web. Returns up to 10 results with titles, URLs, and descriptions.\n" +
+      "- 'read': read a URL as markdown. Pages under 5000 chars return full content; larger pages are LLM-summarized. Also works with PDF URLs.\n" +
+      "- 'extract': AI-powered structured data extraction (pass prompt and/or JSON schema).\n" +
       "- 'scrape': targeted CSS selector extraction.\n" +
       "- 'links': list all links on a page.\n" +
-      "- 'crawl_start': start crawling a website (async). Returns a jobId.\n" +
-      "- 'crawl_check': check crawl results by jobId.\n\n" +
-      "NEVER guess or make up URLs, company info, or current events — search first.\n" +
-      "Only use 'read' if search snippets don't contain enough detail for your answer.",
+      "- 'crawl_start': start async multi-page crawl. Returns a jobId.\n" +
+      "- 'crawl_check': check crawl results by jobId.",
     inputSchema: z.object({
       action: z
         .enum(["search", "read", "extract", "scrape", "links", "crawl_start", "crawl_check"])
@@ -254,6 +288,18 @@ export function createWebTool(
       if (!browserToken) {
         return { ok: false, error: "Browser not configured. Set CF_BROWSER_TOKEN secret." };
       }
+
+      await sem.acquire();
+      try { return await executeWeb(params); } finally { sem.release(); }
+    },
+  };
+
+  async function executeWeb(params: {
+    action: string; query?: string; url?: string; count?: number; engine?: string;
+    prompt?: string; schema?: string; selector?: string; waitForSelector?: string;
+    cacheTTL?: number; jobId?: string; maxPages?: number; staticOnly?: boolean;
+    includePattern?: string; excludePattern?: string;
+  }) {
 
       const headers = {
         Authorization: `Bearer ${browserToken}`,
@@ -302,7 +348,7 @@ export function createWebTool(
             `${BR_BASE}/${accountId}/browser-rendering/markdown${cacheQuery}`,
             { method: "POST", headers, body: JSON.stringify(brBody(params.url, sessionId, waitOpts)) },
           );
-          if (!resp.ok) return { ok: false, error: `Browser API error: ${resp.status}` };
+          if (!resp.ok) { await drainResponse(resp); return { ok: false, error: `Browser API error: ${resp.status}` }; }
           const data = await resp.json<{ success: boolean; result: string }>();
           const raw = data.result ?? "";
 
@@ -329,7 +375,7 @@ export function createWebTool(
             `${BR_BASE}/${accountId}/browser-rendering/json${cacheQuery}`,
             { method: "POST", headers, body: JSON.stringify(body) },
           );
-          if (!resp.ok) return { ok: false, error: `Browser API error: ${resp.status}` };
+          if (!resp.ok) { await drainResponse(resp); return { ok: false, error: `Browser API error: ${resp.status}` }; }
           const data = await resp.json<{ success: boolean; result: unknown }>();
           return { ok: true, url: params.url, data: data.result };
         }
@@ -345,7 +391,7 @@ export function createWebTool(
               body: JSON.stringify(brBody(params.url, sessionId, { ...waitOpts, elements: [{ selector: params.selector }] })),
             },
           );
-          if (!resp.ok) return { ok: false, error: `Browser API error: ${resp.status}` };
+          if (!resp.ok) { await drainResponse(resp); return { ok: false, error: `Browser API error: ${resp.status}` }; }
           const data = await resp.json<{
             success: boolean;
             result: Array<{ results: Array<{ text?: string; html?: string; attributes?: Array<{ name: string; value: string }>; width?: number; height?: number }> }>;
@@ -362,7 +408,7 @@ export function createWebTool(
             `${BR_BASE}/${accountId}/browser-rendering/links${cacheQuery}`,
             { method: "POST", headers, body: JSON.stringify(brBody(params.url, sessionId, waitOpts)) },
           );
-          if (!resp.ok) return { ok: false, error: `Browser API error: ${resp.status}` };
+          if (!resp.ok) { await drainResponse(resp); return { ok: false, error: `Browser API error: ${resp.status}` }; }
           const data = await resp.json<{ success: boolean; result: Array<{ href: string; text: string }> }>();
           return { ok: true, url: params.url, links: data.result?.slice(0, 50) };
         }
@@ -400,7 +446,7 @@ export function createWebTool(
           if (!safeJobId) return { ok: false, error: "invalid jobId" };
 
           const resp = await fetch(`${BR_BASE}/${accountId}/browser-rendering/crawl/${safeJobId}`, { headers });
-          if (!resp.ok) return { ok: false, error: `Crawl check error: ${resp.status}` };
+          if (!resp.ok) { await drainResponse(resp); return { ok: false, error: `Crawl check error: ${resp.status}` }; }
           const data = await resp.json<{
             success: boolean;
             result?: { status: string; pages?: Array<{ url: string; status: string; markdown?: string }> };
@@ -421,8 +467,7 @@ export function createWebTool(
         default:
           return { ok: false, error: `Unknown action: ${params.action}. Use: search, read, extract, scrape, links, crawl_start, crawl_check` };
       }
-    },
-  };
+  }
 }
 
 // ─── LLM Content Summarization ────────────────────────────────────────────────
@@ -430,7 +475,7 @@ export function createWebTool(
 async function summarizeContent(ai: Ai, content: string, url: string): Promise<string | null> {
   try {
     const workersai = createWorkersAI({ binding: ai });
-    const model = workersai(AUXILIARY_MODEL);
+    const model = workersai(DEFAULT_MODEL);
 
     if (content.length > CHUNK_THRESHOLD) {
       return await summarizeChunked(model, content, url);

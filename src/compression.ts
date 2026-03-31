@@ -1,7 +1,7 @@
 import { generateText } from "ai";
 import { createWorkersAI } from "workers-ai-provider";
 import type { ModelMessage } from "ai";
-import { AUXILIARY_MODEL } from "./config/constants.js";
+import { DEFAULT_MODEL } from "./config/constants.js";
 import { FLUSH_SYSTEM_PROMPT } from "./memory/flush.js";
 import { flushToMemory } from "./memory/flush.js";
 
@@ -85,7 +85,7 @@ export async function compressContext(
   // Like Hermes: replace old tool output > 200 chars with a short marker
 
   const workersai = createWorkersAI({ binding: ai });
-  const model = workersai(AUXILIARY_MODEL);
+  const model = workersai(DEFAULT_MODEL);
 
   // Split: keep first + last N, compress the middle
   const first = messages[0];

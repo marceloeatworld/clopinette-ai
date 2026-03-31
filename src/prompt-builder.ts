@@ -1,8 +1,11 @@
 import type { Platform, AgentConfigRow } from "./config/types.js";
 import {
   DEFAULT_AGENT_IDENTITY,
+  TOOL_USE_ENFORCEMENT,
+  SESSION_SEARCH_GUIDANCE,
   MEMORY_GUIDANCE,
   CODEMODE_GUIDANCE,
+  DELEGATION_GUIDANCE,
   PLATFORM_HINTS,
 } from "./config/constants.js";
 import { PERSONALITIES } from "./config/personalities.js";
@@ -72,16 +75,21 @@ export async function buildSystemPrompt(ctx: PromptContext): Promise<string> {
     } catch { /* non-fatal */ }
   }
 
-  // [3] Skills index (compact — names + triggers)
+  // [3] Skills index — only if skills exist (saves tokens when none installed)
   const skillsIndex = getSkillsIndex(ctx.sql);
   if (skillsIndex) {
     blocks.push(skillsIndex);
   }
 
-  // [4] Memory guidance + codemode
+  // [4] Tool-use enforcement + tool-conditional guidance (Hermes-style)
+  blocks.push(TOOL_USE_ENFORCEMENT);
   blocks.push(MEMORY_GUIDANCE);
+  blocks.push(SESSION_SEARCH_GUIDANCE);
   if (ctx.codemodeEnabled) {
     blocks.push(CODEMODE_GUIDANCE);
+  }
+  if (ctx.env.DELEGATE_WORKER) {
+    blocks.push(DELEGATION_GUIDANCE);
   }
 
   // [5] Platform hints
@@ -113,44 +121,13 @@ export async function buildSystemPrompt(ctx: PromptContext): Promise<string> {
     `## Current Context\nDate: ${today}\nPlatform: ${ctx.platform}`
   );
 
-  // [10] Active tool guidance — AUTHORITATIVE list of available tools.
-  // This block is last and overrides any stale tool references in SOUL.md.
-  const hasWeb = !!(ctx.env.CF_ACCOUNT_ID);
-
-  const activeTools: string[] = [
-    "memory — read/write persistent notes (MEMORY.md for world facts, USER.md for user info).",
-    "history — full-text search across past conversation messages.",
-    "skills — load, create, or update reusable skill guides (.md files).",
-    "calendar — add, list, update, or delete calendar events with optional reminders. USE THIS when the user mentions dates, events, flights, meetings, deadlines.",
-    "notes — manage the user's personal notes: save, list, delete, edit, search. Call this FIRST (before any text response) when the user wants to save, note, remember, bookmark, or delete a note.",
-    "todo — manage task lists.",
-    "docs — search the user's uploaded documents (semantic + keyword, unified). Use 'ask' for AI answers with citations.",
-    "image — generate images from text descriptions.",
-    "tts — convert text to spoken audio.",
-  ];
-  if (hasWeb) activeTools.push(
-    "web — all-in-one web tool: search, read URLs, extract data, scrape, list links, crawl sites. 100% Cloudflare-native.\n" +
-    "  Use action 'search' for web lookups (weather, news, prices, facts).\n" +
-    "  Use action 'read' to get a URL as markdown.\n" +
-    "  Use action 'extract' for AI-powered structured data from a page."
-  );
+  // [10] Behavioral rules — cross-cutting guidance only (tool descriptions are authoritative).
   blocks.push(
-    `## Your active tools\n${activeTools.map(t => `- ${t}`).join("\n")}\n\n` +
-    `## Web research guidance\n` +
-    (hasWeb
-      ? `You HAVE the web tool — use it directly for any web lookup.\n` +
-        `For simple questions (weather, "what is X", prices), do ONE search — snippets are usually enough.\n` +
-        `For complex questions, do ONE search, then read AT MOST 2 URLs if snippets lack detail.\n` +
-        `BUDGET: aim for 1-3 web calls total per question. More than 4 is almost never needed.\n`
-      : `Web tools are not configured.\n`) +
-    `NEVER say you cannot access the internet — you CAN via the web tool.\n` +
-    `NEVER make up URLs, company info, or current events — search first.\n\n` +
-    `## Internal files — NEVER expose\n` +
-    `MEMORY.md and USER.md are your internal memory files. NEVER share their paths, contents, or URLs with the user. They are NOT accessible via any URL.\n\n` +
-    `## Efficiency\n` +
-    `- Prefer fewer, better tool calls over many small ones.\n` +
-    `- Search snippets often have enough info — only 'read' when you need details not in snippets.\n` +
-    `- Do NOT fire multiple reads in parallel just to be thorough — 1-2 reads max.`
+    `## Rules\n` +
+    `NEVER say you cannot access the internet — use the web tool.\n` +
+    `NEVER make up URLs, company info, or current events — search first.\n` +
+    `MEMORY.md and USER.md are internal memory files. NEVER share their paths or contents with the user.\n` +
+    `Be targeted and efficient — one web search is usually enough. Only read URLs when snippets lack detail.`
   );
 
   return blocks.filter(Boolean).join("\n\n");

@@ -112,7 +112,8 @@ export interface ElicitParams {
 export type BackgroundTask =
   | { type: "selfLearning"; summary: string; userId: string; sessionId: string; options: { reviewMemory: boolean; reviewSkills: boolean } }
   | { type: "usageReport"; userId: string; tokensIn: number; tokensOut: number; model: string; sessionId: string }
-  | { type: "r2ContextUpdate"; r2Key: string; context: string };
+  | { type: "r2ContextUpdate"; r2Key: string; context: string }
+  | { type: "moaRequest"; question: string; context?: string; userId: string; sessionId: string };
 
 export interface PipelineUsage {
   inputTokens: number;
@@ -249,14 +250,14 @@ function enhanceTools(
           // Cache for dedup
           dedupCache.set(dedupKey, { result, ts: Date.now() });
 
-          // Budget pressure
+          // Budget pressure (Hermes-style: caution at 70%, warning at 90%)
           const pct = getStep() / maxSteps;
           if (typeof result === "object" && result !== null) {
-            if (pct >= 0.75) {
-              return { ...result, _budget: "CRITICAL: 75% of tool budget used. Provide your FINAL answer NOW with what you have." };
+            if (pct >= 0.9) {
+              return { ...result, _budget: "CRITICAL: 90% of tool budget used. Provide your FINAL answer NOW. No more tool calls unless absolutely critical." };
             }
-            if (pct >= 0.5) {
-              return { ...result, _budget: "WARNING: 50% of tool budget used. Start wrapping up — you likely have enough info." };
+            if (pct >= 0.7) {
+              return { ...result, _budget: "CAUTION: 70% of tool budget used. Start consolidating your work." };
             }
           }
           return result;

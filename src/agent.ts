@@ -549,13 +549,11 @@ export class ClopinetteAgent extends AIChatAgent<Env, AgentState> {
     mediaAssets?: MediaAsset[],
     onToolProgress?: (toolName: string, preview: string) => void,
   ): Promise<{ text: string } | { error: string }> {
-    // Serial queue with 2s timeout. If the previous prompt is still running
-    // after 2s (e.g. web search), proceed concurrently so the user can chat
-    // while a search is in progress. Telegram webhook retries are blocked by
-    // update_id dedup before reaching here.
+    // Serial queue with 30s timeout. Messages wait their turn to avoid context mixing.
+    // If a previous prompt is stuck for >30s, proceed concurrently as fallback.
     const raceResult = await Promise.race([
       this.#promptQueue.then(() => "ready" as const),
-      new Promise<"timeout">(r => setTimeout(() => r("timeout"), 2_000)),
+      new Promise<"timeout">(r => setTimeout(() => r("timeout"), 10_000)),
     ]);
     if (raceResult === "timeout") {
       console.warn("[queue] Previous prompt still running after 10s, proceeding concurrently");
@@ -987,32 +985,77 @@ export class ClopinetteAgent extends AIChatAgent<Env, AgentState> {
   async executeCronJob(payload: { jobId: string }): Promise<void> {
     const rows = this.sql<{
       id: string; prompt: string; platform: string | null; chat_id: string | null;
-    }>`SELECT id, prompt, platform, chat_id FROM cron_jobs
+      skill: string | null; deliver: string | null;
+    }>`SELECT id, prompt, platform, chat_id, skill, deliver FROM cron_jobs
        WHERE id = ${payload.jobId} AND enabled = 1`;
     if (rows.length === 0) return;
 
     const job = rows[0];
     try {
-      const result = await this.runPrompt(job.prompt, (job.platform as Platform) ?? "api");
+      // Build prompt — inject skill content if attached
+      let fullPrompt = "";
+      if (job.skill) {
+        const { getSkill } = await import("./memory/skills.js");
+        const skill = await getSkill(this.sql, this.env.SKILLS, this.#userId, job.skill);
+        if (skill?.content) {
+          fullPrompt += `[SYSTEM: The following skill "${job.skill}" is loaded for this task.]\n\n${skill.content}\n\n`;
+        }
+      }
+      // Silent suppression hint (Hermes-style)
+      fullPrompt += `[SYSTEM: If you have a meaningful status report or findings, send them. ` +
+        `Only respond with exactly "[SILENT]" (nothing else) when there is genuinely nothing new to report. ` +
+        `[SILENT] suppresses delivery to the user. Never combine [SILENT] with content.]\n\n`;
+      fullPrompt += job.prompt;
+
+      const result = await this.runPrompt(fullPrompt, (job.platform as Platform) ?? "api");
       if ("error" in result) {
         console.error(`Cron job ${job.id} error: ${result.error}`);
+        // Errors always deliver
+        await this.#deliverCronResult(job, `Cron job error: ${result.error}`);
         return;
       }
 
-      // Deliver to Telegram — requires linked account + env bot token
-      if (job.platform === "telegram" && job.chat_id) {
-        const botToken = this.env.TELEGRAM_BOT_TOKEN;
-        if (!botToken) {
-          console.warn(`Cron job ${job.id}: TELEGRAM_BOT_TOKEN not set, skipping delivery`);
-        } else {
-          await sendTelegramMessage(botToken, parseInt(job.chat_id, 10), result.text);
-        }
+      // [SILENT] check — skip delivery if agent says nothing to report
+      const isSilent = result.text.trim().toUpperCase().startsWith("[SILENT]");
+      if (!isSilent) {
+        await this.#deliverCronResult(job, result.text);
       }
 
       this.sql`UPDATE cron_jobs SET last_run = datetime('now') WHERE id = ${job.id}`;
-      logAudit(this.sql.bind(this), "cron.execute", `${job.id}: ${job.prompt.slice(0, 50)}`);
+      logAudit(this.sql.bind(this), "cron.execute", `${job.id}${isSilent ? " [SILENT]" : ""}: ${job.prompt.slice(0, 50)}`);
     } catch (err) {
       console.error(`Cron job ${payload.jobId} failed:`, err);
+    }
+  }
+
+  /** Deliver cron result to the appropriate platform. */
+  async #deliverCronResult(
+    job: { platform: string | null; chat_id: string | null; deliver: string | null },
+    text: string,
+  ): Promise<void> {
+    const target = job.deliver ?? "origin";
+    const platform = target === "origin" ? job.platform : target.split(":")[0];
+    const chatId = target === "origin" ? job.chat_id : target.split(":")[1] ?? job.chat_id;
+
+    if (!platform || !chatId) return;
+
+    switch (platform) {
+      case "telegram": {
+        const token = this.env.TELEGRAM_BOT_TOKEN;
+        if (token) await sendTelegramMessage(token, parseInt(chatId, 10), text);
+        break;
+      }
+      case "whatsapp": {
+        const accessToken = this.env.WHATSAPP_ACCESS_TOKEN;
+        const phoneId = this.env.WHATSAPP_PHONE_NUMBER_ID;
+        if (accessToken && phoneId) {
+          const { sendWhatsAppMessage } = await import("./gateway/whatsapp.js");
+          await sendWhatsAppMessage(accessToken, phoneId, chatId, text);
+        }
+        break;
+      }
+      default:
+        console.log(`Cron delivery: no handler for platform "${platform}"`);
     }
   }
 
@@ -1160,6 +1203,93 @@ export class ClopinetteAgent extends AIChatAgent<Env, AgentState> {
         case "r2ContextUpdate": {
           const { updateContext } = await import("./media/handler.js");
           await updateContext(this.env.MEMORIES, task.r2Key, task.context);
+          break;
+        }
+        case "moaRequest": {
+          const { generateText } = await import("ai");
+          const { createWorkersAI } = await import("workers-ai-provider");
+          const { trackAuxiliaryUsage } = await import("./pipeline.js");
+
+          const workersai = createWorkersAI({ binding: this.env.AI });
+          const prompt = task.context
+            ? `${task.context}\n\nQuestion: ${task.question}`
+            : task.question;
+
+          const MODELS = ["@cf/qwen/qwen-3-8b", "@cf/google/gemma-3-12b-it"] as const;
+          console.log(`[moa-async] Starting ${MODELS.length} models`);
+
+          const settled = await Promise.allSettled(
+            MODELS.map(async (modelId) => {
+              const result = await generateText({
+                model: workersai(modelId),
+                messages: [{ role: "user", content: prompt }],
+                maxRetries: 1,
+              });
+              trackAuxiliaryUsage(
+                this.sql.bind(this), task.sessionId,
+                result.usage?.inputTokens ?? 0, result.usage?.outputTokens ?? 0,
+                modelId, this.env, task.userId,
+              );
+              return { model: modelId, response: result.text, success: true };
+            }),
+          );
+
+          const results = settled.map((s, i) =>
+            s.status === "fulfilled" ? s.value
+              : { model: MODELS[i], response: `Error: ${s.reason}`, success: false },
+          );
+          const successful = results.filter((r) => r.success && r.response);
+          console.log(`[moa-async] ${successful.length}/${MODELS.length} succeeded`);
+
+          if (successful.length === 0) {
+            console.warn("[moa-async] All models failed");
+            break;
+          }
+
+          // Aggregation — use Qwen (faster than Kimi for aggregation)
+          const responsesBlock = successful
+            .map((r, i) => `${i + 1}. [${r.model}]\n${r.response}`).join("\n\n");
+          const aggregation = await generateText({
+            model: workersai("@cf/qwen/qwen-3-8b"),
+            system: `You received answers from multiple AI models. Synthesize them into a single, high-quality response. Be critical — some answers may be wrong.\n\nResponses:\n\n${responsesBlock}`,
+            messages: [{ role: "user", content: task.question }],
+            maxRetries: 1,
+          });
+          trackAuxiliaryUsage(
+            this.sql.bind(this), task.sessionId,
+            aggregation.usage?.inputTokens ?? 0, aggregation.usage?.outputTokens ?? 0,
+            "moa-aggregator", this.env, task.userId,
+          );
+
+          // Deliver result
+          const moaResult = `**Mixture of Agents** (${successful.length} models)\n\n${aggregation.text}`;
+          // Push to WebSocket
+          for (const ws of this.ctx.getWebSockets()) {
+            ws.send(JSON.stringify({ type: "moa_result", content: moaResult }));
+          }
+          // Deliver to Telegram — resolve chatId from KV link
+          const lastSession = this.sql<{ platform: string }>`
+            SELECT platform FROM sessions WHERE id = ${task.sessionId}`;
+          const moaPlatform = lastSession[0]?.platform;
+
+          if (moaPlatform === "telegram" && this.env.TELEGRAM_BOT_TOKEN) {
+            // KV schema: key="link:tg:<chatId>" value=<userId> — scan to find chatId for this user
+            try {
+              const keys = await this.env.LINKS.list({ prefix: "link:tg:" });
+              for (const key of keys.keys) {
+                const val = await this.env.LINKS.get(key.name);
+                if (val === this.#userId) {
+                  const chatId = key.name.replace("link:tg:", "");
+                  await sendTelegramMessage(this.env.TELEGRAM_BOT_TOKEN, parseInt(chatId, 10), moaResult);
+                  console.log(`[moa-async] Sent to Telegram chatId=${chatId}`);
+                  break;
+                }
+              }
+            } catch (err) {
+              console.warn("[moa-async] KV lookup failed:", err);
+            }
+          }
+          console.log("[moa-async] Result delivered");
           break;
         }
         default:
@@ -1398,6 +1528,8 @@ export class ClopinetteAgent extends AIChatAgent<Env, AgentState> {
       prompt TEXT NOT NULL,
       platform TEXT,
       chat_id TEXT,
+      skill TEXT,
+      deliver TEXT DEFAULT 'origin',
       enabled INTEGER DEFAULT 1,
       last_run TEXT,
       created_at TEXT DEFAULT (datetime('now'))
