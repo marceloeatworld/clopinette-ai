@@ -46,7 +46,7 @@ Identity linking: `/link` in Telegram/WhatsApp -> 5-min code -> enter in web app
 
 ## Tools
 
-11 tools, organized in two tiers. With codemode active, the LLM sees **8 tools total** (1 `codemode` + 7 direct).
+11 primary tools + delegate (conditional). With codemode active, the LLM sees **8-9 tools** (1 `codemode` + 7 direct + optional `delegate`).
 
 ### Codemode tier (orchestration — wrapped in JS sandbox)
 
@@ -70,6 +70,7 @@ Identity linking: `/link` in Telegram/WhatsApp -> 5-min code -> enter in web app
 | `image` | Image generation | Workers AI (FLUX Schnell) |
 | `tts` | Text-to-speech (12 voices) | Workers AI (Deepgram Aura) |
 | `clarify` | Ask structured questions mid-execution | Passthrough |
+| `delegate` | Spawn parallel sub-agents (single or batch up to 3) | DelegateWorker DOs (ephemeral, no SQLite) |
 
 ### Web search
 
@@ -86,8 +87,9 @@ Browser Rendering uses session reuse (`sessionId` + `keep_alive`) to avoid 15-30
 ### Tool enhancements
 
 - **Codemode**: when `LOADER` binding is set, orchestration tools wrap into a single JS sandbox tool. The LLM writes code with `Promise.all`, loops, conditionals — up to 5x token efficiency.
-- **Budget pressure**: warnings at 70%/90% of step limit.
-- **Dedup cache**: same tool+args within 2s returns cached result.
+- **Budget pressure**: Hermes-style warnings at 70%/90% of step limit.
+- **Dedup cache**: same tool+args within 2s returns cached result (5s for delegates).
+- **Concurrency semaphore**: max 2 concurrent web fetches per tool instance (prevents CF deadlocks).
 - **Fuzzy matching**: Levenshtein distance <= 2 corrects hallucinated tool names.
 - **Backward-compat aliases**: old names (`web_search`, `web_browse`, `docs_search`, `session_search`, `save_note`, `image_generate`, `text_to_speech`, etc.) still work as aliases.
 
@@ -116,9 +118,11 @@ Events with optional one-shot reminders via `this.schedule(Date)`. Reminders del
 | Setting | Value |
 |---------|-------|
 | Default model | Kimi K2.5 via Workers AI |
-| Auxiliary model | Granite 4.0 Micro (compression, self-learning, flush, web summarization) |
+| Auxiliary model | Granite 4.0 Micro (routing, browser snapshots) |
+| Heavy auxiliary | Kimi K2.5 (compression, self-learning, web summarization) |
 | BYOK | 12 providers via AI Gateway |
-| Max steps | 25 |
+| Max steps | 6 (parent), 3 (delegate) |
+| Prompt queue | Serial with 10s timeout |
 | Session affinity | Prefix caching (same GPU across turns) |
 | Fallback | BYOK fail -> Workers AI automatic |
 | Context compression | Structured template at 40+ messages, iterative |
@@ -295,7 +299,8 @@ wrangler secret put DISCORD_TOKEN
 ```
 src/
   index.ts              Hono router, webhooks, quota enforcement
-  agent.ts              DO: sessions, notes, calendar, wipe, reminders, cron
+  agent.ts              DO: sessions, notes, calendar, wipe, reminders, cron, delegation
+  delegate-worker.ts    Lightweight DO for parallel sub-agent execution
   pipeline.ts           Inference pipeline (10 steps)
   prompt-builder.ts     System prompt (10 blocks)
   compression.ts        Structured compression + memory flush
@@ -319,6 +324,7 @@ src/
     image-gen-tool.ts     FLUX image generation
     tts-tool.ts           Deepgram text-to-speech
     clarify-tool.ts       Mid-execution questions
+    delegate-tool.ts      Sub-agent delegation (single + batch)
     registry.ts           Tool registration, codemode, aliases
   hub/                  Skills catalog, GitHub source, URL source
   inference/            Provider, router, Anthropic cache control
@@ -330,7 +336,7 @@ workers/outbound/       SSRF-safe fetch proxy for codemode sandbox
 
 ## Cloudflare Services
 
-Workers, Durable Objects (SQLite), Workers AI, AI Gateway, KV, R2 (2 buckets), Browser Rendering, AutoRAG, Dynamic Workers (codemode).
+Workers, Durable Objects (SQLite + ephemeral), Workers AI, AI Gateway, KV, R2 (2 buckets), Browser Rendering, AutoRAG, Dynamic Workers (codemode).
 
 Optional external: SearXNG (self-hosted), Brave Search API (free tier). Both are optional — falls back to Browser Rendering if unconfigured.
 
