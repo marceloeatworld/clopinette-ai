@@ -237,11 +237,26 @@ async function handleWhatsAppOnlyCommand(text: string, ctx: WhatsAppContext, fro
       ].join("\n");
 
     case "/link": {
+      const arg = text.split(/\s+/)[1]?.toLowerCase();
+      // WhatsApp group detection: group JIDs end with @g.us
+      const isGroup = from.endsWith("@g.us");
+
+      if (isGroup && !arg) {
+        return [
+          "Choose a linking mode:",
+          "",
+          "/link trusted — Family mode. Full memory shared with everyone.",
+          "/link shared — Public mode. Clean bot, no private memory.",
+        ].join("\n");
+      }
+
+      const isShared = isGroup && arg === "shared";
       const code = Array.from(crypto.getRandomValues(new Uint8Array(8)))
         .map(b => "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"[b % 36]).join("");
-      const payload = JSON.stringify({ platform: "wa", externalId: from });
+      const payload = JSON.stringify({ platform: "wa", externalId: from, ...(isShared && { shared: true }) });
       await ctx.env.LINKS.put(`link_code:${code}`, payload, { expirationTtl: 300 });
-      return `Your link code: ${code}\n\nEnter this code in the web app at clopinette.app to link your WhatsApp. Expires in 5 minutes.`;
+      const mode = isShared ? " (shared)" : isGroup ? " (trusted)" : "";
+      return `Your link code: ${code}${mode}\n\nEnter this code at clopinette.app to link your WhatsApp. Expires in 5 minutes.`;
     }
 
     default:

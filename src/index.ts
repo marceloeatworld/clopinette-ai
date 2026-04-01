@@ -113,17 +113,25 @@ async function checkQuotaFromKV(
   return { allowed: true };
 }
 
-/** Resolve DO name from platform + external ID. Checks KV for identity link. */
+/**
+ * Resolve DO name from platform + external ID. Checks KV for identity link.
+ * Shared mode: KV value starts with "shared:" — standalone DO, quota on userId.
+ * Trusted mode: KV value is userId — route to user's DO directly.
+ */
 async function resolveDoName(
   links: KVNamespace,
   platform: string,
   externalId: string
-): Promise<{ doName: string; linkedUserId: string | null }> {
-  const linkedUserId = await links.get(kv.link(platform, externalId));
-  return {
-    doName: linkedUserId ?? `${platform}_${externalId}`,
-    linkedUserId,
-  };
+): Promise<{ doName: string; linkedUserId: string | null; shared: boolean }> {
+  const raw = await links.get(kv.link(platform, externalId));
+  if (!raw) return { doName: `${platform}_${externalId}`, linkedUserId: null, shared: false };
+
+  if (raw.startsWith("shared:")) {
+    const userId = raw.slice(7);
+    return { doName: `${platform}_${externalId}`, linkedUserId: userId, shared: true };
+  }
+
+  return { doName: raw, linkedUserId: raw, shared: false };
 }
 
 // ───────────────────────── API: agent management ─────────────────────────
@@ -449,7 +457,7 @@ app.post("/webhook/telegram", async (c) => {
   const isReaction = !!update.message_reaction;
   const isAllowedCommand = /^\/(start|link|help)\b/.test(text) || isReaction;
 
-  const { doName, linkedUserId } = await resolveDoName(c.env.LINKS, "tg", chatId);
+  const { doName, linkedUserId, shared } = await resolveDoName(c.env.LINKS, "tg", chatId);
 
   // Users must link their Telegram to a web account to use the bot
   if (!linkedUserId && !isAllowedCommand) {
@@ -488,6 +496,7 @@ app.post("/webhook/telegram", async (c) => {
       "X-Bot-Token": botToken,
       "X-Chat-Id": chatId,
       "X-Platform": "telegram",
+      ...(shared && { "X-Shared-Mode": "true" }),
       "x-partykit-room": doName,
     },
     body: JSON.stringify(update),
@@ -527,15 +536,23 @@ app.post("/webhook/discord", async (c) => {
     const dcUserId = body.member?.user?.id ?? body.user?.id ?? "";
     if (!dcUserId) return c.json({ type: 4, data: { content: "Could not identify user.", flags: 64 } });
 
+    // Guild → shared DO (like Telegram groups), DM → personal DO
+    const guildId = body.guild_id;
+    const isGuild = !!guildId;
+    const linkPlatform = isGuild ? "dcg" : "dc";
+    const linkId = isGuild ? guildId : dcUserId;
+
     // Identity link check — /link and /help don't require linking
     const isAllowedCommand = ["link", "help"].includes(body.data.name);
-    const { doName, linkedUserId } = await resolveDoName(c.env.LINKS, "dc", dcUserId);
+    const { doName, linkedUserId, shared } = await resolveDoName(c.env.LINKS, linkPlatform, linkId);
 
     if (!linkedUserId && !isAllowedCommand) {
       return Response.json({
         type: 4,
         data: {
-          content: "Link your Discord to your **clopinette.app** account first.\nUse `/link` to get started.",
+          content: isGuild
+            ? "This server isn't linked to a **clopinette.app** account yet.\nUse `/link trusted` or `/link shared` to connect it."
+            : "Link your Discord to your **clopinette.app** account first.\nUse `/link` to get started.",
           flags: 64,
         },
       });
@@ -570,6 +587,7 @@ app.post("/webhook/discord", async (c) => {
         "X-Discord-User-Id": dcUserId,
         "X-Platform": "discord",
         "X-Discord-Source": "interaction",
+        ...(shared && { "X-Shared-Mode": "true" }),
         "x-partykit-room": doName,
       },
       body: rawBody,
@@ -608,7 +626,7 @@ app.post("/webhook/discord-bridge", async (c) => {
   if (!timingSafeEqual(expected, signature)) {
     return new Response("Invalid signature", { status: 401 });
   }
-  let payload: { type: string; message?: { author?: { id?: string; bot?: boolean }; content?: string; channel_id?: string } };
+  let payload: { type: string; message?: { author?: { id?: string; bot?: boolean }; content?: string; channel_id?: string; guild_id?: string } };
   try { payload = JSON.parse(rawBody); } catch { return new Response("ok"); }
 
   if (payload.type !== "MESSAGE_CREATE" || !payload.message) return new Response("ok");
@@ -618,15 +636,23 @@ app.post("/webhook/discord-bridge", async (c) => {
   const text = payload.message.content ?? "";
   if (!dcUserId) return new Response("ok");
 
+  // Guild → shared DO (like Telegram groups), DM → personal DO
+  const guildId = payload.message.guild_id;
+  const isGuild = !!guildId;
+  const linkPlatform = isGuild ? "dcg" : "dc";
+  const linkId = isGuild ? guildId! : dcUserId;
+
   // Identity link + quota (same pattern as Telegram)
   const isAllowedCommand = /^\/(start|link|help)\b/.test(text);
-  const { doName, linkedUserId } = await resolveDoName(c.env.LINKS, "dc", dcUserId);
+  const { doName, linkedUserId, shared } = await resolveDoName(c.env.LINKS, linkPlatform, linkId);
 
   if (!linkedUserId && !isAllowedCommand) {
     const channelId = payload.message.channel_id;
     if (channelId) {
       await sendDiscordMessage(botToken, channelId,
-        "Link your Discord to your **clopinette.app** account first.\nUse `/link` to get started.");
+        isGuild
+          ? "This server isn't linked to a **clopinette.app** account yet.\nType `/link trusted` or `/link shared` to connect it."
+          : "Link your Discord to your **clopinette.app** account first.\nUse `/link` to get started.");
     }
     return new Response("ok");
   }
@@ -663,6 +689,7 @@ app.post("/webhook/discord-bridge", async (c) => {
       "X-Discord-User-Id": dcUserId,
       "X-Platform": "discord",
       "X-Discord-Source": "bridge",
+      ...(shared && { "X-Shared-Mode": "true" }),
       "x-partykit-room": doName,
     },
     body: rawBody,
@@ -722,7 +749,7 @@ app.post("/webhook/whatsapp", async (c) => {
   const text = payload.entry?.[0]?.changes?.[0]?.value?.messages?.[0]?.text?.body ?? "";
   const isAllowedCommand = /^\/(start|link|help)\b/.test(text);
 
-  const { doName, linkedUserId } = await resolveDoName(c.env.LINKS, "wa", from);
+  const { doName, linkedUserId, shared } = await resolveDoName(c.env.LINKS, "wa", from);
 
   if (!linkedUserId && !isAllowedCommand) {
     await sendWhatsAppMessage(accessToken, phoneNumberId, from,
@@ -758,6 +785,7 @@ app.post("/webhook/whatsapp", async (c) => {
       "X-WA-Phone-Number-Id": phoneNumberId,
       "X-WA-From": from,
       "X-Platform": "whatsapp",
+      ...(shared && { "X-Shared-Mode": "true" }),
       "x-partykit-room": doName,
     },
     body: rawBody,

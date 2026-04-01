@@ -111,7 +111,7 @@ export async function registerDiscordCommands(
     { name: "notes", description: "List all notes" },
     { name: "reset", description: "Reset current session" },
     { name: "help", description: "Show available commands" },
-    { name: "link", description: "Link Discord to your clopinette.app account" },
+    { name: "link", description: "Link Discord to your clopinette.app account", options: [{ name: "mode", description: "trusted (family, full memory) or shared (public, no memory)", type: 3, required: false, choices: [{ name: "Trusted (family — full memory)", value: "trusted" }, { name: "Shared (public — no private memory)", value: "shared" }] }] },
   ];
 
   const resp = await fetch(`${DISCORD_API}/applications/${applicationId}/commands`, {
@@ -143,21 +143,44 @@ export async function handleDiscordInteraction(
   const commandName = interaction.data.name;
 
   // /link — ephemeral, no DO needed
+  // Guild → link the server (trusted or shared), DM → link the user
   if (commandName === "link") {
     const dcUserId = interaction.member?.user?.id ?? interaction.user?.id ?? "";
+    const isGuild = !!interaction.guild_id;
+    const mode = interaction.data.options?.find(o => o.name === "mode")?.value;
+
+    // In guilds, require mode choice
+    if (isGuild && !mode) {
+      return Response.json({
+        type: 4,
+        data: {
+          content: [
+            "**Choose a linking mode:**",
+            "",
+            "`/link mode:trusted` — Family mode. Full memory, skills, and history shared with everyone in this server.",
+            "`/link mode:shared` — Public mode. Clean bot, no private memory. Good for friend groups.",
+          ].join("\n"),
+          flags: 64,
+        },
+      });
+    }
+
+    const isShared = isGuild && mode === "shared";
     const code = Array.from(crypto.getRandomValues(new Uint8Array(8)))
       .map(b => "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"[b % 36]).join("");
     const payload = JSON.stringify({
-      platform: "dc",
-      externalId: dcUserId,
-      guildId: interaction.guild_id,
+      platform: isGuild ? "dcg" : "dc",
+      externalId: isGuild ? interaction.guild_id : dcUserId,
+      ...(isShared && { shared: true }),
     });
     await ctx.env.LINKS.put(`link_code:${code}`, payload, { expirationTtl: 300 });
+    const target = isGuild ? "this server" : "your Discord account";
+    const modeLabel = isShared ? " (shared — no private memory)" : isGuild ? " (trusted — full memory)" : "";
     return Response.json({
-      type: 4, // CHANNEL_MESSAGE_WITH_SOURCE
+      type: 4,
       data: {
-        content: `Your link code: \`${code}\`\n\nEnter this code at **clopinette.app** to link your Discord account. Expires in 5 minutes.`,
-        flags: 64, // EPHEMERAL
+        content: `Your link code: \`${code}\`${modeLabel}\n\nEnter this code at **clopinette.app** to link ${target}. Expires in 5 minutes.`,
+        flags: 64,
       },
     });
   }
@@ -181,7 +204,9 @@ export async function handleDiscordInteraction(
           "`/note [text]` — Save or show notes",
           "`/notes` — List all notes",
           "`/reset` — New session",
-          "`/link` — Link to clopinette.app",
+          "`/link` — Link to clopinette.app (DMs)",
+          "`/link mode:trusted` — Link server, full memory (family)",
+          "`/link mode:shared` — Link server, no memory (public)",
           "",
           "**In DMs:** just type naturally — no slash command needed.",
           "",
@@ -384,21 +409,40 @@ async function handleDiscordOnlyCommand(
         "",
         "Send me a message, a photo, or a file and I'll help you out.",
         "",
-        "Already have an account? Use `/link` to connect your Discord to your web account. Same memory, same files, everywhere.",
+        "**Link your account:**",
+        "In DMs: `/link` — connects to your clopinette.app account",
+        "In a server:",
+        "• `/link trusted` — family mode, full memory shared with everyone",
+        "• `/link shared` — public mode, clean bot, no private memory",
         "",
         "New here? Sign up at **clopinette.app**",
       ].join("\n");
 
     case "/link": {
+      const isGuild = !!guildId;
+      const arg = text.split(/\s+/)[1]?.toLowerCase();
+
+      if (isGuild && !arg) {
+        return [
+          "**Choose a linking mode:**",
+          "",
+          "`/link trusted` — Family mode. Full memory, skills, and history shared with everyone.",
+          "`/link shared` — Public mode. Clean bot, no private memory.",
+        ].join("\n");
+      }
+
+      const isShared = isGuild && arg === "shared";
       const code = Array.from(crypto.getRandomValues(new Uint8Array(8)))
         .map(b => "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"[b % 36]).join("");
       const payload = JSON.stringify({
-        platform: "dc",
-        externalId: discordUserId,
-        guildId,
+        platform: isGuild ? "dcg" : "dc",
+        externalId: isGuild ? guildId : discordUserId,
+        ...(isShared && { shared: true }),
       });
       await ctx.env.LINKS.put(`link_code:${code}`, payload, { expirationTtl: 300 });
-      return `Your link code: \`${code}\`\n\nEnter this code at **clopinette.app** to link your Discord account. Expires in 5 minutes.`;
+      const target = isGuild ? "this server" : "your Discord account";
+      const mode = isShared ? " (shared)" : isGuild ? " (trusted)" : "";
+      return `Your link code: \`${code}\`${mode}\n\nEnter this code at **clopinette.app** to link ${target}. Expires in 5 minutes.`;
     }
 
     default:

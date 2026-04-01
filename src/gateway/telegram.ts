@@ -427,6 +427,20 @@ async function handleTelegramOnlyCommand(
       ].join("\n");
     case "/link": {
       const chatIdStr = String(chatId);
+      const isGroup = chatMeta?.type === "group" || chatMeta?.type === "supergroup";
+      const arg = text.split(/\s+/)[1]?.toLowerCase();
+
+      // Groups require mode choice: /link trusted or /link shared
+      if (isGroup && !arg) {
+        return [
+          "*Choose a linking mode:*",
+          "",
+          "`/link trusted` \\— Family mode\\. Full memory, skills, and history shared with everyone in this group\\.",
+          "`/link shared` \\— Public mode\\. Clean bot, no private memory\\. Good for friend groups\\.",
+        ].join("\n");
+      }
+
+      const isShared = isGroup && arg === "shared";
       const code = Array.from(crypto.getRandomValues(new Uint8Array(8)))
         .map(b => "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"[b % 36]).join("");
       const payload = JSON.stringify({
@@ -434,9 +448,11 @@ async function handleTelegramOnlyCommand(
         externalId: chatIdStr,
         chatType: chatMeta?.type ?? "private",
         chatTitle: chatMeta?.title ?? chatIdStr,
+        ...(isShared && { shared: true }),
       });
       await ctx.env.LINKS.put(`link_code:${code}`, payload, { expirationTtl: 300 });
-      return `Your link code: \`${code}\`\n\nEnter this code in the web app to link your Telegram to your account\\. Expires in 5 minutes\\.`;
+      const mode = isShared ? "shared \\(no private memory\\)" : "trusted \\(full memory\\)";
+      return `Your link code: \`${code}\`\nMode: ${mode}\n\nEnter this code in the web app to link\\. Expires in 5 minutes\\.`;
     }
     default:
       return null;

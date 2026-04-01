@@ -28,6 +28,7 @@ export interface PromptContext {
   userId?: string;
   honchoContext?: string | null;
   codemodeEnabled?: boolean;
+  sharedMode?: boolean;
 }
 
 export async function buildSystemPrompt(ctx: PromptContext): Promise<string> {
@@ -98,20 +99,24 @@ export async function buildSystemPrompt(ctx: PromptContext): Promise<string> {
     blocks.push(`## Platform\n${hint}`);
   }
 
-  // [6] MEMORY.md snapshot (frozen at session start)
-  const memoryContent = getPromptMemory(ctx.sql, "memory");
-  if (memoryContent) {
-    blocks.push(`## MEMORY.md\n${memoryContent}`);
+  // [6] MEMORY.md snapshot — skip in shared mode (group without owner's memory)
+  if (!ctx.sharedMode) {
+    const memoryContent = getPromptMemory(ctx.sql, "memory");
+    if (memoryContent) {
+      blocks.push(`## MEMORY.md\n${memoryContent}`);
+    }
   }
 
-  // [7] USER.md snapshot (frozen at session start)
-  const userContent = getPromptMemory(ctx.sql, "user");
-  if (userContent) {
-    blocks.push(`## USER.md\n${userContent}`);
+  // [7] USER.md snapshot — skip in shared mode
+  if (!ctx.sharedMode) {
+    const userContent = getPromptMemory(ctx.sql, "user");
+    if (userContent) {
+      blocks.push(`## USER.md\n${userContent}`);
+    }
   }
 
-  // [8] Honcho context (optional)
-  if (ctx.honchoContext) {
+  // [8] Honcho context (optional) — skip in shared mode
+  if (!ctx.sharedMode && ctx.honchoContext) {
     blocks.push(`## Context (Honcho)\n${ctx.honchoContext}`);
   }
 

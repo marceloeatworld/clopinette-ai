@@ -46,6 +46,8 @@ export class ClopinetteAgent extends AIChatAgent<Env, AgentState> {
 
   #sessionId: string | null = null;
   #userId: string = "default";
+  /** Shared mode — group without owner's memory (set per-request via X-Shared-Mode header). */
+  #sharedMode = false;
   /** Cached system prompt — invalidated on config change or code deploy. */
   #cachedSystemPrompt: string | null = null;
   /** Cached inference config — invalidated on config change. */
@@ -321,6 +323,9 @@ export class ClopinetteAgent extends AIChatAgent<Env, AgentState> {
       logAudit(this.sql.bind(this), "session.delete_all", "account wipe");
       return Response.json({ ok: true, wiped: true });
     }
+
+    // Shared mode — group without owner's memory (header set by Worker based on KV link value)
+    this.#sharedMode = request.headers.get("X-Shared-Mode") === "true";
 
     // Telegram webhooks — return 200 immediately, process in DO background (no time limit).
     // The Worker forwards the request and waits for this response. By returning early,
@@ -661,7 +666,8 @@ export class ClopinetteAgent extends AIChatAgent<Env, AgentState> {
         mediaAssets,
         enableCodemode: !!this.env.LOADER,
         enableCompression: false,
-        enableSelfLearning: true,
+        enableSelfLearning: !this.#sharedMode,
+        sharedMode: this.#sharedMode,
         cachedSystemPrompt: this.#promptVersion === ClopinetteAgent.PROMPT_VERSION ? this.#cachedSystemPrompt : null,
         cachedInferenceConfig: this.#cachedInferenceConfig,
         onCacheSystemPrompt: (p) => { this.#cachedSystemPrompt = p; this.#promptVersion = ClopinetteAgent.PROMPT_VERSION; },

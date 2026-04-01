@@ -60,6 +60,7 @@ export interface PipelineContext {
   enableCodemode?: boolean;      // default: false
   enableCompression?: boolean;   // default: true
   enableSelfLearning?: boolean;  // default: true
+  sharedMode?: boolean;          // group without owner's memory (skip MEMORY.md/USER.md)
   recentToolUse?: number;        // for smart routing (0 = no recent tools)
 
   // Performance: session-level caches (set by the DO, reused across turns)
@@ -483,6 +484,7 @@ export async function runPipeline(
       userId: ctx.userId,
       honchoContext,
       codemodeEnabled,
+      sharedMode: ctx.sharedMode,
     });
     ctx.onCacheSystemPrompt?.(systemPrompt);
   }

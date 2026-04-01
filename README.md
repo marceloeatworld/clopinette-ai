@@ -40,10 +40,28 @@ WebSocket "marcelo"         -> DO "marcelo"
 Telegram chat 123 (linked)  -> DO "marcelo"     (via KV link:tg:123 -> marcelo)
 Telegram chat 456 (free)    -> DO "tg_456"
 WhatsApp +33... (linked)    -> DO "marcelo"
-Discord user 789 (linked)   -> DO "marcelo"     (via KV link:dc:789 -> marcelo)
+Discord DM 789 (linked)     -> DO "marcelo"     (via KV link:dc:789 -> marcelo)
+Discord guild 555 (trusted) -> DO "marcelo"     (via KV link:dcg:555 -> marcelo)
+Discord guild 666 (shared)  -> DO "dcg_666"     (via KV link:dcg:666 -> shared:marcelo)
 ```
 
-Identity linking: `/link` in Telegram/WhatsApp/Discord -> 5-min code -> enter in web app -> shared DO.
+### Identity linking
+
+`/link` in Telegram/WhatsApp/Discord -> 5-min code -> enter in web app -> shared DO.
+
+### Group modes (Telegram, Discord, WhatsApp)
+
+Groups support two linking modes:
+
+| Mode | KV value | DO | Memory | Self-learning |
+|------|----------|-----|--------|---------------|
+| **Trusted** (family) | `userId` | Owner's DO | Full (MEMORY.md + USER.md) | Yes |
+| **Shared** (public) | `shared:userId` | Standalone (`dcg_`, `tg_`) | None | No |
+
+- `/link trusted` — full memory shared with everyone. For family groups.
+- `/link shared` — clean bot, no private memory. For friend groups.
+- `/link` without argument in a group → shows mode choice.
+- Quota is always billed to the account that linked the group.
 
 ## Tools
 
@@ -104,7 +122,7 @@ Browser Rendering uses session reuse (`sessionId` + `keep_alive`) to avoid 15-30
 | Skills | SQLite index + R2 files | Reusable .md with YAML frontmatter |
 | Honcho | External API (opt-in) | AI-native user modeling |
 
-Memory is frozen at session start (writes take effect next session for prefix cache stability). Security-scanned with Unicode NFKD normalization. Self-learning compacts when > 80% full.
+Memory is frozen at session start (writes take effect next session for prefix cache stability). Security-scanned with Unicode NFKD normalization. Self-learning compacts when > 80% full. In shared group mode, MEMORY.md and USER.md are not injected and self-learning is disabled.
 
 ## Calendar
 
