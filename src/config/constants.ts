@@ -136,6 +136,9 @@ export const PLATFORM_HINTS: Record<Platform, string> = {
     "Bold with *text* and code with `text` work. Messages are capped at 4096 characters — split long responses.",
   slack:
     "User is on Slack. Use Slack mrkdwn formatting (*bold*, _italic_, `code`, ```codeblock```). Avoid standard Markdown.",
+  discord:
+    "User is on Discord. Use Discord markdown (**bold**, *italic*, `code`, ```codeblock```, > quote). " +
+    "Messages are capped at 2000 characters — split long responses. Avoid markdown tables.",
   whatsapp:
     "User is on WhatsApp. Use *bold*, _italic_, ~strikethrough~, ```monospace```. Messages are capped at 65536 characters.",
   api: "User is using the raw API. Markdown is supported.",

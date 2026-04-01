@@ -40,9 +40,10 @@ WebSocket "marcelo"         -> DO "marcelo"
 Telegram chat 123 (linked)  -> DO "marcelo"     (via KV link:tg:123 -> marcelo)
 Telegram chat 456 (free)    -> DO "tg_456"
 WhatsApp +33... (linked)    -> DO "marcelo"
+Discord user 789 (linked)   -> DO "marcelo"     (via KV link:dc:789 -> marcelo)
 ```
 
-Identity linking: `/link` in Telegram/WhatsApp -> 5-min code -> enter in web app -> shared DO.
+Identity linking: `/link` in Telegram/WhatsApp/Discord -> 5-min code -> enter in web app -> shared DO.
 
 ## Tools
 
@@ -107,7 +108,7 @@ Memory is frozen at session start (writes take effect next session for prefix ca
 
 ## Calendar
 
-Events with optional one-shot reminders via `this.schedule(Date)`. Reminders delivered on WebSocket + Telegram.
+Events with optional one-shot reminders via `this.schedule(Date)`. Reminders delivered on WebSocket + Telegram + Discord + WhatsApp.
 
 ```
 "RDV dentiste le 20 mars a 20h" -> calendar({ action: "create", title: "Dentiste", startAt: "2026-03-20T20:00:00", reminderMinutes: 30 })
@@ -193,6 +194,7 @@ Core (KV consumer)
 | GET | `/api/admin/audit` | Audit log |
 | GET/DELETE | `/api/admin/config` | Agent config |
 | POST/GET/DELETE | `/api/admin/setup-telegram` | Telegram webhook setup |
+| POST/DELETE | `/api/admin/setup-discord` | Discord slash commands + bridge secret |
 
 ### DO Internal
 
@@ -219,7 +221,8 @@ Core (KV consumer)
 | POST | `/webhook/telegram` | Secret token (timing-safe) |
 | GET/POST | `/webhook/whatsapp` | HMAC-SHA256 |
 | POST | `/webhook/evolution` | Evolution API key |
-| POST | `/webhook/discord` | Ed25519 |
+| POST | `/webhook/discord` | Ed25519 (slash commands) |
+| POST | `/webhook/discord-bridge` | HMAC-SHA256 + timestamp (bridge messages) |
 | POST | `/webhook/slack` | HMAC + timestamp |
 | GET | `/mcp` | MCP server endpoint |
 
@@ -272,6 +275,40 @@ wrangler secret put WHATSAPP_PHONE_NUMBER_ID
 # Set webhook URL in Meta portal: https://your-worker.workers.dev/webhook/whatsapp
 ```
 
+### Discord
+
+Discord uses two channels: **Interactions** (slash commands, works out of the box) and **Gateway bridge** (regular DM/channel messages, requires a small external service).
+
+Discord has no webhook push for regular messages (unlike Telegram/WhatsApp) — the Gateway WebSocket is the only way. The bridge connects to Discord's Gateway, receives `MESSAGE_CREATE` events, and forwards them to the Worker via HMAC-signed HTTP POST.
+
+```bash
+# 1. Secrets
+wrangler secret put DISCORD_PUBLIC_KEY
+wrangler secret put DISCORD_APPLICATION_ID
+wrangler secret put DISCORD_TOKEN
+bun run deploy
+
+# 2. Register slash commands + generate bridge secret
+curl -X POST https://your-worker.workers.dev/api/admin/setup-discord \
+  -H "Authorization: Bearer YOUR_API_AUTH_KEY"
+# Returns: { interactionsUrl, bridgeUrl, bridgeSecret }
+
+# 3. Discord Developer Portal:
+#    - General Information → set Interactions Endpoint URL to the interactionsUrl
+#    - Bot → enable "Message Content Intent" (privileged)
+#    - OAuth2 → generate invite link with scopes: bot, applications.commands
+#      Bot permissions: Send Messages, Read Message History, Attach Files, Add Reactions
+
+# 4. Bridge (for DMs + @mentions — deploy on Coolify or any Docker host)
+cd workers/discord-bridge
+# Set env vars: DISCORD_TOKEN, BRIDGE_SECRET (from step 2), WORKER_URL
+docker compose up -d
+```
+
+Slash commands (`/ask`, `/status`, `/memory`, etc.) work immediately without the bridge. The bridge is only needed for natural conversation in DMs and @mentions in servers.
+
+Bridge security: HMAC-SHA256 signature over `timestamp + body`, anti-replay (5 min window), timing-safe comparison. The shared secret never transits in the request. No public port exposed — the bridge only initiates outbound connections.
+
 ### Optional
 
 ```bash
@@ -288,10 +325,6 @@ wrangler secret put EVOLUTION_API_KEY
 wrangler secret put SLACK_BOT_TOKEN
 wrangler secret put SLACK_SIGNING_SECRET
 
-# Discord
-wrangler secret put DISCORD_PUBLIC_KEY
-wrangler secret put DISCORD_APPLICATION_ID
-wrangler secret put DISCORD_TOKEN
 ```
 
 ## Project Structure
@@ -332,6 +365,7 @@ src/
   gateway/              Telegram, WhatsApp, Evolution API, Slack, Discord adapters
 
 workers/outbound/       SSRF-safe fetch proxy for codemode sandbox
+workers/discord-bridge/ Discord Gateway bridge (Bun + Docker)
 ```
 
 ## Cloudflare Services

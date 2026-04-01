@@ -1,4 +1,4 @@
-export type Platform = "api" | "telegram" | "slack" | "whatsapp" | "websocket";
+export type Platform = "api" | "telegram" | "slack" | "discord" | "whatsapp" | "websocket";
 
 export type ProviderName =
   | "openai"

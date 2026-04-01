@@ -6,6 +6,7 @@ import type { ConfigRequest, SetupRequest } from "./config/types.js";
 import { authMiddleware } from "./enterprise/auth.js";
 import { registerTelegramWebhook, deleteTelegramWebhook, sendTelegramMessage } from "./gateway/telegram.js";
 import { sendWhatsAppMessage } from "./gateway/whatsapp.js";
+import { registerDiscordCommands, sendDiscordMessage } from "./gateway/discord.js";
 import { timingSafeEqual } from "./enterprise/safe-compare.js";
 import type { ClopinetteAgent } from "./agent.js";
 
@@ -191,6 +192,39 @@ app.delete("/api/admin/setup-telegram", async (c) => {
   const botToken = c.env.TELEGRAM_BOT_TOKEN;
   if (botToken) await deleteTelegramWebhook(botToken);
   await c.env.LINKS.delete(kv.botSecret("telegram"));
+  return c.json({ ok: true });
+});
+
+// ───────────────────────── API: Discord setup (admin) ─────────────────────────
+
+/**
+ * Register Discord slash commands and generate bridge secret.
+ */
+app.post("/api/admin/setup-discord", async (c) => {
+  const botToken = c.env.DISCORD_TOKEN;
+  const applicationId = c.env.DISCORD_APPLICATION_ID;
+  if (!botToken || !applicationId) return c.json({ error: "DISCORD_TOKEN and DISCORD_APPLICATION_ID secrets not set" }, 500);
+
+  // Register global slash commands
+  const result = await registerDiscordCommands(applicationId, botToken);
+  if (!result.ok) return c.json({ error: "Failed to register Discord commands" }, 502);
+
+  // Generate bridge secret (for the external Gateway bridge)
+  const bridgeSecret = crypto.randomUUID();
+  await c.env.LINKS.put(kv.botSecret("discord"), bridgeSecret);
+
+  const workerUrl = new URL(c.req.url).origin;
+  return c.json({
+    ok: true,
+    commands: result.count,
+    interactionsUrl: `${workerUrl}/webhook/discord`,
+    bridgeUrl: `${workerUrl}/webhook/discord-bridge`,
+    bridgeSecret,
+  });
+});
+
+app.delete("/api/admin/setup-discord", async (c) => {
+  await c.env.LINKS.delete(kv.botSecret("discord"));
   return c.json({ ok: true });
 });
 
@@ -460,9 +494,12 @@ app.post("/webhook/telegram", async (c) => {
   }));
 });
 
+// Discord Interactions (slash commands) — verified via Ed25519
 app.post("/webhook/discord", async (c) => {
   const publicKey = c.env.DISCORD_PUBLIC_KEY;
-  if (!publicKey) return c.json({ error: "Not configured" }, 501);
+  const botToken = c.env.DISCORD_TOKEN;
+  const applicationId = c.env.DISCORD_APPLICATION_ID;
+  if (!publicKey || !botToken || !applicationId) return c.json({ error: "Not configured" }, 501);
 
   // Verify Ed25519 signature before processing
   const signature = c.req.header("X-Signature-Ed25519") ?? "";
@@ -480,11 +517,156 @@ app.post("/webhook/discord", async (c) => {
   );
   if (!isValid) return new Response("Invalid signature", { status: 401 });
 
-  // Handle Discord PING (required for endpoint verification)
   const body = JSON.parse(rawBody);
+
+  // PING — required for Discord endpoint verification
   if (body.type === 1) return c.json({ type: 1 });
 
-  return c.json({ error: "Discord not implemented" }, 501);
+  // APPLICATION_COMMAND (type 2) — slash commands
+  if (body.type === 2 && body.data) {
+    const dcUserId = body.member?.user?.id ?? body.user?.id ?? "";
+    if (!dcUserId) return c.json({ type: 4, data: { content: "Could not identify user.", flags: 64 } });
+
+    // Identity link check — /link and /help don't require linking
+    const isAllowedCommand = ["link", "help"].includes(body.data.name);
+    const { doName, linkedUserId } = await resolveDoName(c.env.LINKS, "dc", dcUserId);
+
+    if (!linkedUserId && !isAllowedCommand) {
+      return Response.json({
+        type: 4,
+        data: {
+          content: "Link your Discord to your **clopinette.app** account first.\nUse `/link` to get started.",
+          flags: 64,
+        },
+      });
+    }
+
+    // Quota check
+    if (linkedUserId && !isAllowedCommand) {
+      const quota = await checkQuotaFromKV(
+        c.env.LINKS, linkedUserId, c.env.GATEWAY_URL,
+        c.env.GATEWAY_INTERNAL_KEY ?? c.env.WS_SIGNING_SECRET
+      );
+      if (!quota.allowed) {
+        const msg = quota.reason === "payment_failed"
+          ? "Your payment failed. Update billing at clopinette.app/billing"
+          : quota.reason === "monthly_limit" || quota.reason === "daily_limit"
+            ? "Usage limit reached. Check clopinette.app/dashboard"
+            : "Discord bot is available on Pro and BYOK plans. Upgrade at clopinette.app/pricing";
+        return Response.json({ type: 4, data: { content: msg, flags: 64 } });
+      }
+    }
+
+    // Route to DO — the DO handles the interaction (deferred response + async processing)
+    const id = c.env.CLOPINETTE_AGENT.idFromName(doName);
+    const stub = c.env.CLOPINETTE_AGENT.get(id);
+
+    return stub.fetch(new Request(c.req.raw.url, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Discord-Token": botToken,
+        "X-Discord-Application-Id": applicationId,
+        "X-Discord-User-Id": dcUserId,
+        "X-Platform": "discord",
+        "X-Discord-Source": "interaction",
+        "x-partykit-room": doName,
+      },
+      body: rawBody,
+    }));
+  }
+
+  return c.json({ type: 1 });
+});
+
+// Discord bridge messages (Gateway WebSocket → HTTP forward)
+app.post("/webhook/discord-bridge", async (c) => {
+  const botToken = c.env.DISCORD_TOKEN;
+  const applicationId = c.env.DISCORD_APPLICATION_ID;
+  if (!botToken || !applicationId) return c.json({ error: "Not configured" }, 501);
+
+  // Verify HMAC-SHA256 signature (bridge signs timestamp+body with shared secret)
+  const storedSecret = await c.env.LINKS.get(kv.botSecret("discord"));
+  if (!storedSecret) return new Response("Unauthorized", { status: 401 });
+
+  const timestamp = c.req.header("X-Bridge-Timestamp") ?? "";
+  const signature = c.req.header("X-Bridge-Signature") ?? "";
+  const rawBody = await c.req.text();
+
+  // Reject stale requests (>5 min) to prevent replay attacks
+  const age = Math.abs(Date.now() / 1000 - Number(timestamp));
+  if (!timestamp || !signature || age > 300) {
+    return new Response("Unauthorized", { status: 401 });
+  }
+
+  const hmacKey = await crypto.subtle.importKey(
+    "raw", new TextEncoder().encode(storedSecret),
+    { name: "HMAC", hash: "SHA-256" }, false, ["sign"],
+  );
+  const computed = await crypto.subtle.sign("HMAC", hmacKey, new TextEncoder().encode(timestamp + rawBody));
+  const expected = `sha256=${Array.from(new Uint8Array(computed)).map(b => b.toString(16).padStart(2, "0")).join("")}`;
+  if (!timingSafeEqual(expected, signature)) {
+    return new Response("Invalid signature", { status: 401 });
+  }
+  let payload: { type: string; message?: { author?: { id?: string; bot?: boolean }; content?: string; channel_id?: string } };
+  try { payload = JSON.parse(rawBody); } catch { return new Response("ok"); }
+
+  if (payload.type !== "MESSAGE_CREATE" || !payload.message) return new Response("ok");
+  if (payload.message.author?.bot) return new Response("ok"); // Ignore bot messages
+
+  const dcUserId = payload.message.author?.id ?? "";
+  const text = payload.message.content ?? "";
+  if (!dcUserId) return new Response("ok");
+
+  // Identity link + quota (same pattern as Telegram)
+  const isAllowedCommand = /^\/(start|link|help)\b/.test(text);
+  const { doName, linkedUserId } = await resolveDoName(c.env.LINKS, "dc", dcUserId);
+
+  if (!linkedUserId && !isAllowedCommand) {
+    const channelId = payload.message.channel_id;
+    if (channelId) {
+      await sendDiscordMessage(botToken, channelId,
+        "Link your Discord to your **clopinette.app** account first.\nUse `/link` to get started.");
+    }
+    return new Response("ok");
+  }
+
+  if (linkedUserId && !isAllowedCommand) {
+    const quota = await checkQuotaFromKV(
+      c.env.LINKS, linkedUserId, c.env.GATEWAY_URL,
+      c.env.GATEWAY_INTERNAL_KEY ?? c.env.WS_SIGNING_SECRET
+    );
+    if (!quota.allowed) {
+      const channelId = payload.message.channel_id;
+      if (channelId) {
+        const msg = quota.reason === "payment_failed"
+          ? "Your payment failed. Update billing at clopinette.app/billing"
+          : quota.reason === "monthly_limit" || quota.reason === "daily_limit"
+            ? "Usage limit reached. Check clopinette.app/dashboard"
+            : "Discord bot is available on Pro and BYOK plans. Upgrade at clopinette.app/pricing";
+        await sendDiscordMessage(botToken, channelId, msg);
+      }
+      return new Response("ok");
+    }
+  }
+
+  // Route to DO
+  const id = c.env.CLOPINETTE_AGENT.idFromName(doName);
+  const stub = c.env.CLOPINETTE_AGENT.get(id);
+
+  return stub.fetch(new Request(c.req.raw.url, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "X-Discord-Token": botToken,
+      "X-Discord-Application-Id": applicationId,
+      "X-Discord-User-Id": dcUserId,
+      "X-Platform": "discord",
+      "X-Discord-Source": "bridge",
+      "x-partykit-room": doName,
+    },
+    body: rawBody,
+  }));
 });
 
 app.post("/webhook/slack", async (c) => {

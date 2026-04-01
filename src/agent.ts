@@ -9,6 +9,8 @@ import { verifyWsToken } from "./token.js";
 import { timingSafeEqual } from "./enterprise/safe-compare.js";
 import { handleTelegramUpdate, sendTelegramMessage } from "./gateway/telegram.js";
 import { handleWhatsAppUpdate } from "./gateway/whatsapp.js";
+import { handleDiscordInteraction, handleDiscordMessage, processInteractionDeferred, sendDiscordMessage } from "./gateway/discord.js";
+import type { DiscordInteraction, DiscordBridgePayload } from "./gateway/discord.js";
 import { runPipeline } from "./pipeline.js";
 import { getSessionMessages } from "./memory/session-search.js";
 import { getPromptMemory } from "./memory/prompt-memory.js";
@@ -396,6 +398,57 @@ export class ClopinetteAgent extends AIChatAgent<Env, AgentState> {
           this.#cachedInferenceConfig = null;
         },
       });
+    }
+
+    // Discord — Interactions (slash commands) and bridge messages
+    if (request.method === "POST" && (url.pathname.includes("/webhook/discord") || url.pathname.includes("/webhook/discord-bridge"))) {
+      await this.#ensureSession("discord");
+      const botToken = request.headers.get("X-Discord-Token") ?? "";
+      const applicationId = request.headers.get("X-Discord-Application-Id") ?? "";
+      const source = request.headers.get("X-Discord-Source") ?? "";
+      const rawBody = await request.text();
+
+      const discordCtx = {
+        sql: this.sql.bind(this),
+        env: this.env,
+        sessionId: this.#sessionId!,
+        userId: this.#userId,
+        botToken,
+        applicationId,
+        runPrompt: (text: string, media?: MediaAsset[], onToolProgress?: (toolName: string, preview: string) => void) =>
+          this.runPrompt(text, "discord", media, onToolProgress),
+        r2Memories: this.env.MEMORIES,
+        onCacheInvalidate: () => {
+          this.#cachedSystemPrompt = null;
+          this.#cachedInferenceConfig = null;
+        },
+      };
+
+      if (source === "interaction") {
+        // Slash command — return the initial response (type 5 deferred) to Discord,
+        // then process asynchronously in the DO background (no time limit).
+        const interaction: DiscordInteraction = JSON.parse(rawBody);
+        const response = await handleDiscordInteraction(interaction, discordCtx);
+
+        // For deferred responses (type 5), process in background
+        if (interaction.type === 2 && interaction.data && !["link", "help"].includes(interaction.data.name)) {
+          this.ctx.waitUntil(
+            processInteractionDeferred(interaction, discordCtx)
+              .catch(err => console.error("[discord] interaction error:", err))
+          );
+        }
+        return response;
+      }
+
+      // Bridge message — return 200 immediately, process in background
+      const payload: DiscordBridgePayload = JSON.parse(rawBody);
+      if (payload.type === "MESSAGE_CREATE" && payload.message) {
+        this.ctx.waitUntil(
+          handleDiscordMessage(payload.message, discordCtx)
+            .catch(err => console.error("[discord] bridge message error:", err))
+        );
+      }
+      return new Response("ok");
     }
 
     return super.onRequest(request);
@@ -1054,6 +1107,11 @@ export class ClopinetteAgent extends AIChatAgent<Env, AgentState> {
         }
         break;
       }
+      case "discord": {
+        const dcToken = this.env.DISCORD_TOKEN;
+        if (dcToken) await sendDiscordMessage(dcToken, chatId, text);
+        break;
+      }
       default:
         console.log(`Cron delivery: no handler for platform "${platform}"`);
     }
@@ -1272,21 +1330,31 @@ export class ClopinetteAgent extends AIChatAgent<Env, AgentState> {
             SELECT platform FROM sessions WHERE id = ${task.sessionId}`;
           const moaPlatform = lastSession[0]?.platform;
 
-          if (moaPlatform === "telegram" && this.env.TELEGRAM_BOT_TOKEN) {
-            // KV schema: key="link:tg:<chatId>" value=<userId> — scan to find chatId for this user
-            try {
-              const keys = await this.env.LINKS.list({ prefix: "link:tg:" });
-              for (const key of keys.keys) {
-                const val = await this.env.LINKS.get(key.name);
-                if (val === this.#userId) {
-                  const chatId = key.name.replace("link:tg:", "");
-                  await sendTelegramMessage(this.env.TELEGRAM_BOT_TOKEN, parseInt(chatId, 10), moaResult);
-                  console.log(`[moa-async] Sent to Telegram chatId=${chatId}`);
-                  break;
+          // Deliver to platform — resolve chatId/channelId from KV link
+          if (moaPlatform && moaPlatform !== "websocket") {
+            const prefix = moaPlatform === "telegram" ? "link:tg:" : moaPlatform === "discord" ? "link:dc:" : moaPlatform === "whatsapp" ? "link:wa:" : null;
+            if (prefix) {
+              try {
+                const keys = await this.env.LINKS.list({ prefix });
+                for (const key of keys.keys) {
+                  const val = await this.env.LINKS.get(key.name);
+                  if (val === this.#userId) {
+                    const externalId = key.name.replace(prefix, "");
+                    if (moaPlatform === "telegram" && this.env.TELEGRAM_BOT_TOKEN) {
+                      await sendTelegramMessage(this.env.TELEGRAM_BOT_TOKEN, parseInt(externalId, 10), moaResult);
+                    } else if (moaPlatform === "discord" && this.env.DISCORD_TOKEN) {
+                      await sendDiscordMessage(this.env.DISCORD_TOKEN, externalId, moaResult);
+                    } else if (moaPlatform === "whatsapp" && this.env.WHATSAPP_ACCESS_TOKEN && this.env.WHATSAPP_PHONE_NUMBER_ID) {
+                      const { sendWhatsAppMessage } = await import("./gateway/whatsapp.js");
+                      await sendWhatsAppMessage(this.env.WHATSAPP_ACCESS_TOKEN, this.env.WHATSAPP_PHONE_NUMBER_ID, externalId, moaResult);
+                    }
+                    console.log(`[moa-async] Sent to ${moaPlatform} externalId=${externalId}`);
+                    break;
+                  }
                 }
+              } catch (err) {
+                console.warn("[moa-async] KV lookup failed:", err);
               }
-            } catch (err) {
-              console.warn("[moa-async] KV lookup failed:", err);
             }
           }
           console.log("[moa-async] Result delivered");
