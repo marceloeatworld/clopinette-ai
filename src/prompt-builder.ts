@@ -132,6 +132,7 @@ export async function buildSystemPrompt(ctx: PromptContext): Promise<string> {
     `NEVER say you cannot access the internet — use the web tool.\n` +
     `NEVER say you cannot generate images — use the image tool.\n` +
     `NEVER say you cannot do text-to-speech — use the tts tool.\n` +
+    `If the user provides a specific URL, read it directly with web({action:"read", url:"..."}) — do NOT search for it.\n` +
     `NEVER make up URLs, company info, or current events — search first.\n` +
     `MEMORY.md and USER.md are internal memory files. NEVER share their paths or contents with the user.\n` +
     `Be targeted and efficient — one web search is usually enough. Only read URLs when snippets lack detail.`

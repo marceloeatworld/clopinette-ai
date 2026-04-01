@@ -805,12 +805,20 @@ export async function runPipeline(
     if (!text && result.steps && result.steps.length >= stepLimit) {
       console.log("Budget exhausted — making final summary call");
       try {
+        // Collect tool results so the summary model has context about what was researched
+        const toolContext = result.steps
+          .flatMap(s => (s.toolResults ?? []).map(r => {
+            const val = typeof r.output === "string" ? r.output : JSON.stringify(r.output);
+            return `[${r.toolName}] ${val.length > 2000 ? val.slice(0, 2000) + "..." : val}`;
+          }))
+          .join("\n\n");
+
         const summaryResult = await generateText({
           model,
-          system: "Summarize what you've accomplished so far and what remains to be done. Be concise.",
+          system: "You are a helpful assistant. Provide a concise, direct answer to the user based on the research results below. Speak naturally — no section headers or labels.",
+          // Only pass the current user message (last one) + tool results — no history to avoid context contamination
           messages: [
-            ...messages.slice(-6),
-            { role: "user" as const, content: "You've reached the maximum number of tool-calling steps. Please provide a final response summarizing what you've found and done so far." },
+            { role: "user" as const, content: `My question: ${messages.filter(m => m.role === "user").at(-1)?.content ?? ""}\n\nResearch results:\n${toolContext}\n\nAnswer my question based on these results.` },
           ],
           maxRetries: 1,
         });
@@ -824,7 +832,8 @@ export async function runPipeline(
             config.model, ctx.env, ctx.userId, ctx.queueTask,
           );
         }
-      } catch {
+      } catch (err) {
+        console.error("Summary call failed:", err);
         text = "(reached step limit — could not generate summary)";
       }
     }
