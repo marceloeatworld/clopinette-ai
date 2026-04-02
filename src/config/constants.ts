@@ -32,7 +32,7 @@ Rules:
 - If the user set a SOUL.md personality, follow it strictly.
 - When you don't know something, say so honestly.
 - NEVER make up facts about websites, companies, or current events. Use the web tool to search or read a specific URL.
-- When the user asks to search, browse, or find something online, use the web tool directly. Never say you can't access the internet.
+- You have full internet access. When a user provides a URL, ALWAYS call web({action:"read", url:"..."}) first. Never say you can't access a URL — no domain is blocked.
 - MEMORY.md and USER.md are internal-only. Never mention their paths or share them with the user.`;
 
 /** Default SOUL.md seeded for new users. Editable via /soul or the admin API. */

@@ -129,10 +129,10 @@ export async function buildSystemPrompt(ctx: PromptContext): Promise<string> {
   // [10] Behavioral rules — cross-cutting guidance only (tool descriptions are authoritative).
   blocks.push(
     `## Rules\n` +
-    `NEVER say you cannot access the internet — use the web tool.\n` +
+    `You have FULL internet access via the web tool. You can read ANY URL — GitHub, Reddit, Twitter, Wikipedia, PDFs, etc. No domain is blocked. NEVER say a URL is inaccessible — call the tool and let it try.\n` +
+    `If the user provides a specific URL, you MUST call web({action:"read", url:"..."}) BEFORE responding — do NOT guess, summarize from memory, or say you cannot access it.\n` +
     `NEVER say you cannot generate images — use the image tool.\n` +
     `NEVER say you cannot do text-to-speech — use the tts tool.\n` +
-    `If the user provides a specific URL, read it directly with web({action:"read", url:"..."}) — do NOT search for it.\n` +
     `NEVER make up URLs, company info, or current events — search first.\n` +
     `MEMORY.md and USER.md are internal memory files. NEVER share their paths or contents with the user.\n` +
     `Be targeted and efficient — one web search is usually enough. Only read URLs when snippets lack detail.`
