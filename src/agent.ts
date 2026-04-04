@@ -71,6 +71,8 @@ export class ClopinetteAgent extends AIChatAgent<Env, AgentState> {
 
   async onStart(): Promise<void> {
     this.#initSchema();
+    this.#migrateLegacyConfig();
+    this.#syncCurrentModelFromConfig();
     if (this.name) this.#userId = this.name;
     // Run post-schema tasks independently — a transient R2 failure should not block cron sync
     const results = await Promise.allSettled([
@@ -82,6 +84,47 @@ export class ClopinetteAgent extends AIChatAgent<Env, AgentState> {
     for (const r of results) {
       if (r.status === "rejected") console.warn("onStart task failed:", r.reason);
     }
+  }
+
+  /**
+   * Migrate legacy single "api_key" and "model" rows to per-provider schema.
+   * Idempotent — safe to run on every startup.
+   *
+   *   api_key              → api_key:{provider}   (dropped if provider is workers-ai/missing — orphan key)
+   *   model                → model:{provider}     (kept for all providers including workers-ai)
+   */
+  #migrateLegacyConfig(): void {
+    const providerRow = this.sql<{ value: string }>`
+      SELECT value FROM agent_config WHERE key = 'provider'
+    `;
+    const provider = providerRow[0]?.value;
+
+    // ── api_key migration ──
+    const legacyKey = this.sql<{ value: string; encrypted: number; key_version: number }>`
+      SELECT value, encrypted, key_version FROM agent_config WHERE key = 'api_key'
+    `;
+    if (legacyKey.length > 0) {
+      if (!provider || provider === "workers-ai") {
+        this.sql`DELETE FROM agent_config WHERE key = 'api_key'`;
+      } else {
+        const { value, encrypted, key_version } = legacyKey[0];
+        this.sql`INSERT OR IGNORE INTO agent_config (key, value, encrypted, key_version, updated_at)
+          VALUES (${`api_key:${provider}`}, ${value}, ${encrypted}, ${key_version}, datetime('now'))`;
+        this.sql`DELETE FROM agent_config WHERE key = 'api_key'`;
+      }
+    }
+
+    // ── model migration (all providers, including workers-ai) ──
+    const legacyModel = this.sql<{ value: string; encrypted: number; key_version: number }>`
+      SELECT value, encrypted, key_version FROM agent_config WHERE key = 'model'
+    `;
+    if (legacyModel.length > 0 && provider) {
+      const { value, encrypted, key_version } = legacyModel[0];
+      this.sql`INSERT OR IGNORE INTO agent_config (key, value, encrypted, key_version, updated_at)
+        VALUES (${`model:${provider}`}, ${value}, ${encrypted}, ${key_version}, datetime('now'))`;
+      this.sql`DELETE FROM agent_config WHERE key = 'model'`;
+    }
+    // If no provider, keep legacy model as-is (will be migrated on next config save)
   }
 
   async onConnect(
@@ -708,9 +751,21 @@ export class ClopinetteAgent extends AIChatAgent<Env, AgentState> {
   }
 
   static ALLOWED_CONFIG_KEYS = new Set([
-    "api_key", "provider", "model", "soul_md", "autorag_name", "display_name",
+    "api_key", "provider", "model", "auxiliary_provider", "soul_md", "autorag_name", "display_name",
     "honcho_base_url", "honcho_api_key", "honcho_app_id", "token_budget", "personality",
   ]);
+
+  /** Accepts whitelisted keys plus per-provider keys (api_key:{p}, model:{p}, auxiliary_model:{p}). */
+  static isAllowedConfigKey(key: string): boolean {
+    if (ClopinetteAgent.ALLOWED_CONFIG_KEYS.has(key)) return true;
+    for (const prefix of ["api_key:", "model:", "auxiliary_model:"]) {
+      if (key.startsWith(prefix)) {
+        const provider = key.slice(prefix.length);
+        return provider.length > 0 && /^[a-z0-9_-]+$/.test(provider);
+      }
+    }
+    return false;
+  }
 
   @callable()
   async updateConfig(
@@ -718,7 +773,7 @@ export class ClopinetteAgent extends AIChatAgent<Env, AgentState> {
     value: string,
     shouldEncrypt: boolean
   ): Promise<void> {
-    if (!ClopinetteAgent.ALLOWED_CONFIG_KEYS.has(key)) {
+    if (!ClopinetteAgent.isAllowedConfigKey(key)) {
       throw new Error(`Invalid config key: ${key}`);
     }
     await this.ctx.blockConcurrencyWhile(async () => {
@@ -737,14 +792,56 @@ export class ClopinetteAgent extends AIChatAgent<Env, AgentState> {
       this.#cachedSystemPrompt = null;
       this.#cachedInferenceConfig = null;
     });
+
+    // Keep state.currentModel synced so dashboards and session logging reflect the current config
+    if (key === "provider" || key.startsWith("model:") || key === "model") {
+      this.#syncCurrentModelFromConfig();
+    }
+  }
+
+  /** Re-resolve the effective model from config and push into state.currentModel. */
+  #syncCurrentModelFromConfig(): void {
+    const rows = this.sql<{ key: string; value: string }>`
+      SELECT key, value FROM agent_config
+      WHERE key IN ('provider', 'model') OR key LIKE 'model:%'
+    `;
+    const map = new Map(rows.map((r) => [r.key, r.value]));
+    const provider = map.get("provider");
+    const effectiveModel = (provider ? map.get(`model:${provider}`) : undefined) ?? map.get("model") ?? DEFAULT_MODEL;
+    if (this.state.currentModel !== effectiveModel) {
+      this.setState({ ...this.state, currentModel: effectiveModel });
+    }
   }
 
   @callable()
   async getStatus(): Promise<StatusResponse> {
-    const rows = this.sql<AgentConfigRow>`SELECT key FROM agent_config`;
+    const rows = this.sql<AgentConfigRow & { value: string }>`SELECT key, value FROM agent_config`;
+    const providerRow = rows.find((r) => r.key === "provider");
+    const provider = providerRow?.value;
+
+    // Build per-provider models map (model:openai → "gpt-4o", ...)
+    const configuredModels: Record<string, string> = {};
+    const configuredAuxiliaryModels: Record<string, string> = {};
+    for (const r of rows) {
+      if (r.key.startsWith("model:")) configuredModels[r.key.slice("model:".length)] = r.value;
+      else if (r.key.startsWith("auxiliary_model:")) configuredAuxiliaryModels[r.key.slice("auxiliary_model:".length)] = r.value;
+    }
+    // Legacy model row — expose under active provider if no per-provider row exists
+    const legacyModel = rows.find((r) => r.key === "model")?.value;
+    if (legacyModel && provider && !configuredModels[provider]) configuredModels[provider] = legacyModel;
+
+    const auxiliaryProvider = rows.find((r) => r.key === "auxiliary_provider")?.value;
+    const effectiveAuxProvider = auxiliaryProvider ?? provider;
+
     return {
       ok: true,
       currentModel: this.state.currentModel,
+      currentProvider: provider,
+      configuredModel: provider ? configuredModels[provider] : legacyModel,
+      configuredModels,
+      currentAuxiliaryProvider: auxiliaryProvider,
+      configuredAuxiliaryModel: effectiveAuxProvider ? configuredAuxiliaryModels[effectiveAuxProvider] : undefined,
+      configuredAuxiliaryModels,
       platform: this.state.platform,
       status: this.state.status,
       configuredKeys: rows.map((r) => r.key),
@@ -906,7 +1003,7 @@ export class ClopinetteAgent extends AIChatAgent<Env, AgentState> {
 
   @callable()
   async deleteConfig(key: string): Promise<{ ok: boolean; error?: string }> {
-    if (!ClopinetteAgent.ALLOWED_CONFIG_KEYS.has(key)) {
+    if (!ClopinetteAgent.isAllowedConfigKey(key)) {
       return { ok: false, error: `Cannot delete key: ${key}` };
     }
     this.sql`DELETE FROM agent_config WHERE key = ${key}`;

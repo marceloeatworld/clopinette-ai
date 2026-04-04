@@ -1,7 +1,16 @@
 import type { Platform } from "./types.js";
 
-export const DEFAULT_MODEL = "@cf/moonshotai/kimi-k2.5";
-export const AUXILIARY_MODEL = "@cf/ibm-granite/granite-4.0-h-micro";
+export const KIMI_MODEL = "@cf/moonshotai/kimi-k2.5";
+export const GEMMA_MODEL = "@cf/google/gemma-4-26b-a4b-it";
+export const DEFAULT_MODEL = KIMI_MODEL;
+export const AUXILIARY_MODEL = GEMMA_MODEL;
+
+/** Workers AI models available to trial + pro plans (BYOK plan has none). */
+export const WORKERS_AI_MODELS = [KIMI_MODEL, GEMMA_MODEL] as const;
+export type WorkersAiModel = typeof WORKERS_AI_MODELS[number];
+export function isWorkersAiModel(model: string): model is WorkersAiModel {
+  return (WORKERS_AI_MODELS as readonly string[]).includes(model);
+}
 
 export const MAX_PERSISTED_MESSAGES = 200;
 

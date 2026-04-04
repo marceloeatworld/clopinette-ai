@@ -147,10 +147,30 @@ app.post("/api/setup", async (c) => {
 app.post("/api/config", async (c) => {
   const body = await c.req.json<ConfigRequest>();
   if (!body.userId) return c.json({ error: "userId required" }, 400);
+  if (body.apiKey && (!body.provider || body.provider === "workers-ai")) {
+    return c.json({ error: "apiKey requires a BYOK provider" }, 400);
+  }
+  if (body.model && !body.provider) {
+    return c.json({ error: "model requires a provider (for per-provider storage)" }, 400);
+  }
+  if (body.auxiliaryModel && !body.auxiliaryProvider && !body.provider) {
+    return c.json({ error: "auxiliaryModel requires auxiliaryProvider (or provider)" }, 400);
+  }
+  if (body.provider && !/^[a-z0-9_-]+$/.test(body.provider)) {
+    return c.json({ error: "Invalid provider slug" }, 400);
+  }
+  if (body.auxiliaryProvider && !/^[a-z0-9_-]+$/.test(body.auxiliaryProvider)) {
+    return c.json({ error: "Invalid auxiliaryProvider slug" }, 400);
+  }
   const agent = await getAgent(c.env, body.userId);
   if (body.provider) await agent.updateConfig("provider", body.provider, false);
-  if (body.model) await agent.updateConfig("model", body.model, false);
-  if (body.apiKey) await agent.updateConfig("api_key", body.apiKey, true);
+  if (body.auxiliaryProvider) await agent.updateConfig("auxiliary_provider", body.auxiliaryProvider, false);
+  if (body.model && body.provider) await agent.updateConfig(`model:${body.provider}`, body.model, false);
+  if (body.auxiliaryModel) {
+    const auxProv = body.auxiliaryProvider ?? body.provider;
+    if (auxProv) await agent.updateConfig(`auxiliary_model:${auxProv}`, body.auxiliaryModel, false);
+  }
+  if (body.apiKey && body.provider) await agent.updateConfig(`api_key:${body.provider}`, body.apiKey, true);
   if (body.soulMd) {
     if (body.soulMd.length > 10000) return c.json({ error: "soul_md max 10000 chars" }, 400);
     await agent.updateConfig("soul_md", body.soulMd, false);

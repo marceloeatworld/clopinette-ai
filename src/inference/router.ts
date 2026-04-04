@@ -1,5 +1,3 @@
-import { AUXILIARY_MODEL } from "../config/constants.js";
-
 /**
  * Smart model routing — use cheap model for simple turns, primary for complex.
  *
@@ -25,6 +23,7 @@ export interface RoutingDecision {
 export function routeModel(
   userMessage: string,
   configuredModel: string,
+  auxiliaryModel: string,
   toolCallCount: number,
   forceModel?: string
 ): RoutingDecision {
@@ -41,7 +40,7 @@ export function routeModel(
   if (userMessage.length < MAX_SIMPLE_LENGTH) {
     for (const pattern of SIMPLE_PATTERNS) {
       if (pattern.test(userMessage.trim())) {
-        return { model: AUXILIARY_MODEL, reason: "simple" };
+        return { model: auxiliaryModel, reason: "simple" };
       }
     }
   }

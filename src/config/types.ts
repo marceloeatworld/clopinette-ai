@@ -1,18 +1,21 @@
 export type Platform = "api" | "telegram" | "slack" | "discord" | "whatsapp" | "websocket";
 
+/** Cloudflare AI Gateway provider slugs (https://developers.cloudflare.com/ai-gateway/usage/providers/). */
 export type ProviderName =
+  | "workers-ai"
   | "openai"
   | "anthropic"
   | "google-ai-studio"
   | "groq"
   | "deepseek"
-  | "xai"
-  | "openrouter"
-  | "azure-openai"
-  | "aws-bedrock"
+  | "grok"          // xAI (CF's official slug, not "xai")
   | "mistral"
   | "cohere"
-  | "workers-ai";
+  | "perplexity"
+  | "openrouter"
+  | "cerebras"
+  | "huggingface"
+  | "replicate";
 
 export interface AgentState {
   status: "idle" | "thinking" | "streaming";
@@ -61,6 +64,12 @@ export interface InferenceConfig {
   apiKey?: string;
   provider?: string;
   model: string;
+  /** Auxiliary provider (may differ from primary). Undefined means "use primary provider". */
+  auxiliaryProvider?: string;
+  /** Decrypted API key for the auxiliary provider (may be the same as apiKey if same provider). */
+  auxiliaryApiKey?: string;
+  /** Model used for simple/greeting routing. Bound to auxiliaryProvider's credentials. */
+  auxiliaryModel: string;
 }
 
 export interface SetupRequest {
@@ -73,6 +82,8 @@ export interface ConfigRequest {
   provider?: ProviderName;
   apiKey?: string;
   model?: string;
+  auxiliaryProvider?: string;
+  auxiliaryModel?: string;
   soulMd?: string;
   autoragName?: string;
 }
@@ -94,6 +105,18 @@ export interface MediaAsset {
 export interface StatusResponse {
   ok: boolean;
   currentModel: string;
+  /** Stored provider config (workers-ai | openai | anthropic | ...). */
+  currentProvider?: string;
+  /** Model for the current provider (shortcut for configuredModels[currentProvider]). */
+  configuredModel?: string;
+  /** Per-provider saved models: { openai: "gpt-4o", anthropic: "claude-3-5-sonnet", ... }. */
+  configuredModels?: Record<string, string>;
+  /** Auxiliary provider if different from primary (cross-provider auxiliary). */
+  currentAuxiliaryProvider?: string;
+  /** Auxiliary model for the current auxiliary provider. */
+  configuredAuxiliaryModel?: string;
+  /** Per-provider saved auxiliary models. */
+  configuredAuxiliaryModels?: Record<string, string>;
   platform: Platform;
   status: string;
   configuredKeys: string[];

@@ -364,11 +364,20 @@ export async function runPipeline(
   const routing = routeModel(
     ctx.userText,
     config.model,
+    config.auxiliaryModel,
     ctx.recentToolUse ?? 0
   );
 
-  // Step 3: Create model with session affinity
-  const model = createModel(config, ctx.env, routing.model, {
+  // Step 3: Create model with session affinity.
+  // For the simple/auxiliary branch, swap in the auxiliary provider's credentials
+  // (cross-provider: primary=openai + auxiliary=anthropic, etc.).
+  const useAuxCreds = routing.reason === "simple"
+    && config.auxiliaryProvider !== undefined
+    && config.auxiliaryProvider !== config.provider;
+  const effectiveConfig = useAuxCreds
+    ? { ...config, apiKey: config.auxiliaryApiKey, provider: config.auxiliaryProvider }
+    : config;
+  const model = createModel(effectiveConfig, ctx.env, routing.model, {
     sessionAffinity: ctx.userId,
   });
 

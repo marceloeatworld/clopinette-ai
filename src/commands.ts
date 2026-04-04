@@ -61,10 +61,14 @@ export async function handleCommand(
 
     case "/status": {
       const configRows = ctx.sql<{ key: string; value: string }>`
-        SELECT key, value FROM agent_config WHERE key IN ('model', 'display_name')
+        SELECT key, value FROM agent_config WHERE key IN ('model', 'provider', 'display_name') OR key LIKE 'model:%'
       `;
       const configMap = new Map(configRows.map(r => [r.key, r.value]));
-      const model = configMap.get("model") || "@cf/moonshotai/kimi-k2.5";
+      const provider = configMap.get("provider");
+      // Prefer model:{provider}, fall back to legacy model, then default
+      const model = (provider && configMap.get(`model:${provider}`))
+        || configMap.get("model")
+        || "@cf/moonshotai/kimi-k2.5";
       const name = configMap.get("display_name") || "not set";
 
       const now = new Date();
