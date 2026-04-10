@@ -43,7 +43,7 @@ function createUsageTracker(ctx: ToolContext) {
   return (tokensIn: number, tokensOut: number, model: string) => {
     trackAuxiliaryUsage(
       ctx.sql, ctx.sessionId, tokensIn, tokensOut,
-      model, ctx.env as Env, ctx.userId, ctx.queueTask,
+      model, ctx.env as Env, ctx.userId,
     );
   };
 }
@@ -77,7 +77,7 @@ export function buildTools(ctx: ToolContext) {
     image: imageTool,
     clarify: createClarifyTool(),
     ...(ctx.playwrightMcp ? { browser: createBrowserTool(ctx) } : {}),
-    ...((ctx.env as Env).DELEGATE_WORKER ? { delegate: createDelegateTool(ctx) } : {}),
+    ...((ctx.env as Env).DELEGATE_WORKFLOW ? { delegate: createDelegateTool(ctx) } : {}),
 
     // ── Backward-compat aliases (old names → new tools) ─────────────────
     session_search: historyTool,

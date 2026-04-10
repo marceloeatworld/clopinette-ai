@@ -42,6 +42,14 @@ export class ClopinetteAgent extends AIChatAgent<Env, AgentState> {
     status: "idle",
     currentModel: DEFAULT_MODEL,
     platform: "websocket",
+    currentSessionId: null,
+    currentSessionTitle: null,
+    plan: null,
+    tokensThisMonth: 0,
+    tokensThisSession: 0,
+    quotaAllowed: true,
+    activeTool: null,
+    pendingDelegates: [],
   };
 
   #sessionId: string | null = null;
@@ -74,6 +82,10 @@ export class ClopinetteAgent extends AIChatAgent<Env, AgentState> {
     this.#migrateLegacyConfig();
     this.#syncCurrentModelFromConfig();
     if (this.name) this.#userId = this.name;
+
+    // Hydrate AgentState from SQLite + KV so the first WS message already has fresh live state
+    await this.#hydrateAgentState();
+
     // Run post-schema tasks independently — a transient R2 failure should not block cron sync
     const results = await Promise.allSettled([
       this.#restoreMemoryFromR2(),
@@ -83,6 +95,45 @@ export class ClopinetteAgent extends AIChatAgent<Env, AgentState> {
     ]);
     for (const r of results) {
       if (r.status === "rejected") console.warn("onStart task failed:", r.reason);
+    }
+  }
+
+  /** Load plan, quota and token totals from KV + SQLite into the broadcasted AgentState. */
+  async #hydrateAgentState(): Promise<void> {
+    try {
+      // Plan (pushed by the gateway cron + stripe webhooks)
+      const plan = await this.env.LINKS.get(`plan:${this.#userId}`);
+
+      // Quota cache (refreshed by the gateway cron every 5 min)
+      const quotaRaw = await this.env.LINKS.get(`quota:${this.#userId}`);
+      let quota: { allowed: boolean; reason?: string } | null = null;
+      if (quotaRaw) {
+        try { quota = JSON.parse(quotaRaw); } catch { /* malformed */ }
+      }
+
+      // Monthly token usage — sum of the current month's sessions
+      const monthStart = `${new Date().toISOString().slice(0, 7)}-01`;
+      const monthly = this.sql<{ total: number }>`
+        SELECT COALESCE(SUM(total_tokens), 0) as total FROM sessions WHERE started_at >= ${monthStart}
+      `;
+
+      // Pending delegates still running for this user
+      const pending = this.sql<{ id: string; goal: string; created_at: string }>`
+        SELECT id, goal, created_at FROM pending_delegates
+        WHERE status IN ('queued', 'running')
+        ORDER BY created_at DESC LIMIT 10
+      `;
+
+      this.setState({
+        ...this.state,
+        plan,
+        tokensThisMonth: monthly[0]?.total ?? 0,
+        quotaAllowed: quota?.allowed ?? true,
+        quotaReason: quota?.reason,
+        pendingDelegates: pending.map((p) => ({ id: p.id, goal: p.goal, startedAt: p.created_at })),
+      });
+    } catch (err) {
+      console.warn("hydrate state failed:", err);
     }
   }
 
@@ -180,192 +231,6 @@ export class ClopinetteAgent extends AIChatAgent<Env, AgentState> {
   async onRequest(request: Request): Promise<Response> {
     try {
     const url = new URL(request.url);
-
-    if (url.pathname.endsWith("/api/do/setup") && request.method === "POST") {
-      const body = await request.json<{ displayName?: string }>();
-      const result = await this.setup(body.displayName);
-      return Response.json(result);
-    }
-    if (url.pathname.endsWith("/api/do/config") && request.method === "POST") {
-      const body = await request.json<{ key: string; value: string; encrypt: boolean }>();
-      await this.updateConfig(body.key, body.value, body.encrypt);
-      return Response.json({ ok: true });
-    }
-    if (url.pathname.endsWith("/api/do/status") && request.method === "GET") {
-      const result = await this.getStatus();
-      return Response.json(result);
-    }
-
-    // ── Notes CRUD ──
-    if (url.pathname.endsWith("/api/do/notes") && request.method === "GET") {
-      const rows = this.sql<{ id: number; content: string; source: string; pinned: number; created_at: string; updated_at: string }>`
-        SELECT id, content, source, pinned, created_at, updated_at FROM notes ORDER BY pinned DESC, created_at DESC LIMIT 500
-      `;
-      const pinned = rows.filter(r => r.pinned);
-      const rest = rows.filter(r => !r.pinned);
-      const grouped: Record<string, typeof rows> = {};
-      for (const note of rest) {
-        const day = note.created_at.slice(0, 10);
-        (grouped[day] ??= []).push(note);
-      }
-      return Response.json({ notes: grouped, pinned });
-    }
-    if (url.pathname.match(/\/api\/do\/notes\/\d+\/pin$/) && request.method === "POST") {
-      const noteId = url.pathname.split("/").slice(-2, -1)[0];
-      this.sql`UPDATE notes SET pinned = CASE WHEN pinned = 0 THEN 1 ELSE 0 END, updated_at = datetime('now') WHERE id = ${noteId}`;
-      return Response.json({ ok: true });
-    }
-    if (url.pathname.endsWith("/api/do/notes") && request.method === "POST") {
-      const { content, source } = await request.json<{ content: string; source?: string }>();
-      if (!content?.trim()) return Response.json({ error: "Content required" }, { status: 400 });
-      if (content.length > MAX_NOTE_LENGTH) return Response.json({ error: `Max ${MAX_NOTE_LENGTH} chars` }, { status: 400 });
-      const safeSource = VALID_SOURCES.has(source || "") ? source! : "manual";
-      const enriched = await enrichNoteUrl(content.trim());
-      // Re-check length after enrichment (OG tags can inflate the content)
-      const finalContent = enriched.length > MAX_NOTE_LENGTH ? enriched.slice(0, MAX_NOTE_LENGTH) : enriched;
-      this.sql`INSERT INTO notes (content, source) VALUES (${finalContent}, ${safeSource})`;
-      const row = this.sql<{ id: number }>`SELECT last_insert_rowid() as id`;
-      return Response.json({ id: row[0]?.id }, { status: 201 });
-    }
-    if (url.pathname.match(/\/api\/do\/notes\/\d+$/) && request.method === "PUT") {
-      const noteId = url.pathname.split("/").pop()!;
-      const { content } = await request.json<{ content: string }>();
-      if (!content?.trim()) return Response.json({ error: "Content required" }, { status: 400 });
-      if (content.length > MAX_NOTE_LENGTH) return Response.json({ error: `Max ${MAX_NOTE_LENGTH} chars` }, { status: 400 });
-      this.sql`UPDATE notes SET content = ${content.trim()}, updated_at = datetime('now') WHERE id = ${noteId}`;
-      return Response.json({ ok: true });
-    }
-    if (url.pathname.match(/\/api\/do\/notes\/\d+$/) && request.method === "DELETE") {
-      const noteId = url.pathname.split("/").pop()!;
-      this.sql`DELETE FROM notes WHERE id = ${noteId}`;
-      return Response.json({ ok: true });
-    }
-
-    // ── Calendar CRUD ──
-    if (url.pathname.endsWith("/api/do/calendar") && request.method === "GET") {
-      const from = url.searchParams.get("from") ?? new Date().toISOString().slice(0, 10);
-      const to = url.searchParams.get("to") ?? new Date(Date.now() + 90 * 86_400_000).toISOString().slice(0, 10);
-      const limit = Math.max(1, Math.min(parseInt(url.searchParams.get("limit") ?? "100", 10) || 100, 500));
-      const rows = this.sql<{
-        id: string; title: string; description: string | null; start_at: string;
-        end_at: string | null; all_day: number; location: string | null;
-        reminder_minutes: number | null; reminder_delivered: number;
-        source: string; created_at: string; updated_at: string;
-      }>`SELECT * FROM calendar_events
-         WHERE start_at >= ${from} AND start_at <= ${to.includes("T") ? to : to + "T23:59:59"}
-         ORDER BY start_at ASC LIMIT ${limit}`;
-      const grouped: Record<string, typeof rows> = {};
-      for (const evt of rows) {
-        const day = evt.start_at.slice(0, 10);
-        (grouped[day] ??= []).push(evt);
-      }
-      return Response.json({ events: grouped, total: rows.length });
-    }
-    if (url.pathname.endsWith("/api/do/calendar") && request.method === "POST") {
-      const body = await request.json<{
-        title: string; startAt: string; endAt?: string; allDay?: boolean;
-        location?: string; description?: string; reminderMinutes?: number;
-      }>();
-      if (!body.title?.trim()) return Response.json({ error: "Title required" }, { status: 400 });
-      if (!body.startAt) return Response.json({ error: "startAt required" }, { status: 400 });
-      const id = crypto.randomUUID();
-      this.sql`INSERT INTO calendar_events (id, title, description, start_at, end_at, all_day, location, reminder_minutes, source)
-        VALUES (${id}, ${body.title.trim()}, ${body.description ?? null}, ${body.startAt},
-                ${body.endAt ?? null}, ${body.allDay ? 1 : 0}, ${body.location ?? null},
-                ${body.reminderMinutes ?? null}, 'manual')`;
-      // Schedule reminder if requested
-      if (body.reminderMinutes != null) {
-        const fireAt = new Date(new Date(body.startAt).getTime() - body.reminderMinutes * 60_000);
-        if (fireAt > new Date()) {
-          await this.schedule(fireAt, "executeReminder" as keyof this, { eventId: id });
-        }
-      }
-      return Response.json({ id, title: body.title.trim(), startAt: body.startAt }, { status: 201 });
-    }
-    if (url.pathname.match(/\/api\/do\/calendar\/[^/]+$/) && request.method === "PUT") {
-      const eventId = url.pathname.split("/").pop()!;
-      const exists = this.sql<{ id: string }>`SELECT id FROM calendar_events WHERE id = ${eventId}`;
-      if (exists.length === 0) return Response.json({ error: "Event not found" }, { status: 404 });
-      const body = await request.json<{
-        title?: string; startAt?: string; endAt?: string; allDay?: boolean;
-        location?: string; description?: string; reminderMinutes?: number | null;
-      }>();
-      if (body.title !== undefined) this.sql`UPDATE calendar_events SET title = ${body.title.trim()} WHERE id = ${eventId}`;
-      if (body.startAt !== undefined) this.sql`UPDATE calendar_events SET start_at = ${body.startAt} WHERE id = ${eventId}`;
-      if (body.endAt !== undefined) this.sql`UPDATE calendar_events SET end_at = ${body.endAt} WHERE id = ${eventId}`;
-      if (body.allDay !== undefined) this.sql`UPDATE calendar_events SET all_day = ${body.allDay ? 1 : 0} WHERE id = ${eventId}`;
-      if (body.location !== undefined) this.sql`UPDATE calendar_events SET location = ${body.location} WHERE id = ${eventId}`;
-      if (body.description !== undefined) this.sql`UPDATE calendar_events SET description = ${body.description} WHERE id = ${eventId}`;
-      if (body.reminderMinutes !== undefined) {
-        this.sql`UPDATE calendar_events SET reminder_minutes = ${body.reminderMinutes}, reminder_delivered = 0 WHERE id = ${eventId}`;
-      }
-      this.sql`UPDATE calendar_events SET updated_at = datetime('now') WHERE id = ${eventId}`;
-      // Re-schedule reminder if startAt or reminderMinutes changed
-      if (body.startAt !== undefined || body.reminderMinutes !== undefined) {
-        const evt = this.sql<{ start_at: string; reminder_minutes: number | null }>`
-          SELECT start_at, reminder_minutes FROM calendar_events WHERE id = ${eventId}`;
-        if (evt.length > 0 && evt[0].reminder_minutes != null) {
-          const fireAt = new Date(new Date(evt[0].start_at).getTime() - evt[0].reminder_minutes * 60_000);
-          if (fireAt > new Date()) {
-            await this.schedule(fireAt, "executeReminder" as keyof this, { eventId });
-          }
-        }
-      }
-      return Response.json({ ok: true });
-    }
-    if (url.pathname.match(/\/api\/do\/calendar\/[^/]+$/) && request.method === "DELETE") {
-      const eventId = url.pathname.split("/").pop()!;
-      const exists = this.sql<{ id: string }>`SELECT id FROM calendar_events WHERE id = ${eventId}`;
-      if (exists.length === 0) return Response.json({ error: "Event not found" }, { status: 404 });
-      this.sql`DELETE FROM calendar_events WHERE id = ${eventId}`;
-      return Response.json({ ok: true });
-    }
-
-    // ── Account wipe (called by gateway on user.deleted) ──
-    if (url.pathname.endsWith("/api/do/wipe") && request.method === "POST") {
-      // Wipe all user data from this DO
-      // Note: table names must be literal (SQL tagged templates parameterize values, not identifiers)
-      try { this.sql`DELETE FROM sessions`; } catch { /* table may not exist */ }
-      try { this.sql`DELETE FROM session_messages`; } catch { /* */ }
-      try { this.sql`DELETE FROM notes`; } catch { /* */ }
-      try { this.sql`DELETE FROM calendar_events`; } catch { /* */ }
-      try { this.sql`DELETE FROM skills`; } catch { /* */ }
-      try { this.sql`DELETE FROM cron_jobs`; } catch { /* */ }
-      try { this.sql`DELETE FROM audit_log`; } catch { /* */ }
-      try { this.sql`DELETE FROM doc_context`; } catch { /* */ }
-      try { this.sql`DELETE FROM hub_installed`; } catch { /* */ }
-      try { this.sql`DELETE FROM todos`; } catch { /* */ }
-      this.sql`UPDATE prompt_memory SET content = '', updated_at = datetime('now')`;
-      this.sql`DELETE FROM agent_config`;
-      this.sql`DELETE FROM cf_ai_chat_agent_messages`;
-      // Wipe R2 user data
-      const safeId = this.#userId.replace(/[^a-zA-Z0-9_-]/g, "");
-      if (safeId) {
-        try {
-          for (const prefix of [`${safeId}/docs/`, `${safeId}/audio/`, `${safeId}/images/`, `${safeId}/skills/`]) {
-            const listed = await this.env.MEMORIES.list({ prefix, limit: 1000 });
-            if (listed.objects.length > 0) {
-              await this.env.MEMORIES.delete(listed.objects.map(o => o.key));
-            }
-          }
-          // Delete memory/user files
-          await this.env.MEMORIES.delete(`${safeId}/MEMORY.md`).catch(() => {});
-          await this.env.MEMORIES.delete(`${safeId}/USER.md`).catch(() => {});
-        } catch { /* R2 may be unavailable */ }
-        // R2 Skills
-        try {
-          const skillsList = await this.env.SKILLS.list({ prefix: `${safeId}/`, limit: 1000 });
-          if (skillsList.objects.length > 0) {
-            await this.env.SKILLS.delete(skillsList.objects.map(o => o.key));
-          }
-        } catch { /* R2 may be unavailable */ }
-      }
-      this.#sessionId = null;
-      this.#cachedSystemPrompt = null;
-      this.#cachedInferenceConfig = null;
-      logAudit(this.sql.bind(this), "session.delete_all", "account wipe");
-      return Response.json({ ok: true, wiped: true });
-    }
 
     // Shared mode — group without owner's memory (header set by Worker based on KV link value)
     this.#sharedMode = request.headers.get("X-Shared-Mode") === "true";
@@ -594,9 +459,30 @@ export class ClopinetteAgent extends AIChatAgent<Env, AgentState> {
         onCacheSystemPrompt: (p) => { this.#cachedSystemPrompt = p; this.#promptVersion = ClopinetteAgent.PROMPT_VERSION; },
         onCacheInferenceConfig: (c) => { this.#cachedInferenceConfig = c; },
         onStateChange: (status) => {
-          this.setState({ ...this.state, status });
+          this.setState({
+            ...this.state,
+            status,
+            ...(status === "idle" ? { activeTool: null } : {}),
+          });
         },
         onComplete: (result) => {
+          // Update token accounting in live state
+          const added = result.usage ? (result.usage.inputTokens ?? 0) + (result.usage.outputTokens ?? 0) : 0;
+
+          // Refresh pending delegates (tools may have inserted new pending rows during the turn)
+          const pending = this.sql<{ id: string; goal: string; created_at: string }>`
+            SELECT id, goal, created_at FROM pending_delegates
+            WHERE status IN ('queued', 'running')
+            ORDER BY created_at DESC LIMIT 10
+          `;
+
+          this.setState({
+            ...this.state,
+            tokensThisMonth: this.state.tokensThisMonth + added,
+            tokensThisSession: this.state.tokensThisSession + added,
+            pendingDelegates: pending.map((p) => ({ id: p.id, goal: p.goal, startedAt: p.created_at })),
+          });
+
           // Deliver generated media (TTS audio, images) to WebSocket clients
           if (result.mediaDelivery?.length) {
             for (const ws of this.ctx.getWebSockets()) {
@@ -611,8 +497,10 @@ export class ClopinetteAgent extends AIChatAgent<Env, AgentState> {
           this.queue("executeBackgroundTask" as keyof this, task).catch((err) =>
             console.warn("Failed to queue background task:", err));
         },
+        waitUntil: (promise) => this.ctx.waitUntil(promise),
         elicitInput: (params) => this.elicitInput(params),
         onToolProgress: (toolName, preview) => {
+          this.setState({ ...this.state, activeTool: toolName });
           for (const ws of this.ctx.getWebSockets()) {
             ws.send(JSON.stringify({ type: "tool_progress", tool: toolName, preview }));
           }
@@ -722,6 +610,7 @@ export class ClopinetteAgent extends AIChatAgent<Env, AgentState> {
           this.queue("executeBackgroundTask" as keyof this, task).catch((err) =>
             console.warn("Failed to queue background task:", err));
         },
+        waitUntil: (promise) => this.ctx.waitUntil(promise),
         elicitInput: (params) => this.elicitInput(params),
         onToolProgress,
       },
@@ -1108,6 +997,315 @@ export class ClopinetteAgent extends AIChatAgent<Env, AgentState> {
     return { installed: listInstalled(this.sql.bind(this)) };
   }
 
+  // ───────────────────────── Notes CRUD (RPC @callable) ─────────────────────────
+
+  @callable()
+  async listNotes(): Promise<{
+    notes: Record<string, Array<{ id: number; content: string; source: string; pinned: number; created_at: string; updated_at: string }>>;
+    pinned: Array<{ id: number; content: string; source: string; pinned: number; created_at: string; updated_at: string }>;
+  }> {
+    const rows = this.sql<{ id: number; content: string; source: string; pinned: number; created_at: string; updated_at: string }>`
+      SELECT id, content, source, pinned, created_at, updated_at FROM notes ORDER BY pinned DESC, created_at DESC LIMIT 500
+    `;
+    const pinned = rows.filter((r) => r.pinned);
+    const rest = rows.filter((r) => !r.pinned);
+    const grouped: Record<string, typeof rows> = {};
+    for (const note of rest) {
+      const day = note.created_at.slice(0, 10);
+      (grouped[day] ??= []).push(note);
+    }
+    return { notes: grouped, pinned };
+  }
+
+  @callable()
+  async createNote(content: string, source?: string): Promise<{ id: number }> {
+    if (!content?.trim()) throw new Error("Content required");
+    if (content.length > MAX_NOTE_LENGTH) throw new Error(`Max ${MAX_NOTE_LENGTH} chars`);
+    const safeSource = VALID_SOURCES.has(source ?? "") ? (source as string) : "manual";
+    const enriched = await enrichNoteUrl(content.trim());
+    const finalContent = enriched.length > MAX_NOTE_LENGTH ? enriched.slice(0, MAX_NOTE_LENGTH) : enriched;
+    this.sql`INSERT INTO notes (content, source) VALUES (${finalContent}, ${safeSource})`;
+    const row = this.sql<{ id: number }>`SELECT last_insert_rowid() as id`;
+    return { id: row[0]?.id ?? 0 };
+  }
+
+  @callable()
+  async updateNote(noteId: number, content: string): Promise<{ ok: true }> {
+    if (!content?.trim()) throw new Error("Content required");
+    if (content.length > MAX_NOTE_LENGTH) throw new Error(`Max ${MAX_NOTE_LENGTH} chars`);
+    this.sql`UPDATE notes SET content = ${content.trim()}, updated_at = datetime('now') WHERE id = ${noteId}`;
+    return { ok: true };
+  }
+
+  @callable()
+  async deleteNote(noteId: number): Promise<{ ok: true }> {
+    this.sql`DELETE FROM notes WHERE id = ${noteId}`;
+    return { ok: true };
+  }
+
+  @callable()
+  async pinNote(noteId: number): Promise<{ ok: true }> {
+    this.sql`UPDATE notes SET pinned = CASE WHEN pinned = 0 THEN 1 ELSE 0 END, updated_at = datetime('now') WHERE id = ${noteId}`;
+    return { ok: true };
+  }
+
+  // ───────────────────────── Calendar CRUD (RPC @callable) ─────────────────────────
+
+  @callable()
+  async listCalendarEvents(opts?: { from?: string; to?: string; limit?: number }): Promise<{
+    events: Record<string, Array<{ id: string; title: string; description: string | null; start_at: string; end_at: string | null; all_day: number; location: string | null; reminder_minutes: number | null; reminder_delivered: number; source: string; created_at: string; updated_at: string }>>;
+    total: number;
+  }> {
+    const from = opts?.from ?? new Date().toISOString().slice(0, 10);
+    const toRaw = opts?.to ?? new Date(Date.now() + 90 * 86_400_000).toISOString().slice(0, 10);
+    const to = toRaw.includes("T") ? toRaw : toRaw + "T23:59:59";
+    const limit = Math.max(1, Math.min(opts?.limit ?? 100, 500));
+    const rows = this.sql<{
+      id: string; title: string; description: string | null; start_at: string;
+      end_at: string | null; all_day: number; location: string | null;
+      reminder_minutes: number | null; reminder_delivered: number;
+      source: string; created_at: string; updated_at: string;
+    }>`SELECT * FROM calendar_events
+       WHERE start_at >= ${from} AND start_at <= ${to}
+       ORDER BY start_at ASC LIMIT ${limit}`;
+    const grouped: Record<string, typeof rows> = {};
+    for (const evt of rows) {
+      const day = evt.start_at.slice(0, 10);
+      (grouped[day] ??= []).push(evt);
+    }
+    return { events: grouped, total: rows.length };
+  }
+
+  @callable()
+  async createCalendarEvent(input: {
+    title: string; startAt: string; endAt?: string; allDay?: boolean;
+    location?: string; description?: string; reminderMinutes?: number;
+  }): Promise<{ id: string; title: string; startAt: string }> {
+    if (!input.title?.trim()) throw new Error("Title required");
+    if (!input.startAt) throw new Error("startAt required");
+    const id = crypto.randomUUID();
+    this.sql`INSERT INTO calendar_events (id, title, description, start_at, end_at, all_day, location, reminder_minutes, source)
+      VALUES (${id}, ${input.title.trim()}, ${input.description ?? null}, ${input.startAt},
+              ${input.endAt ?? null}, ${input.allDay ? 1 : 0}, ${input.location ?? null},
+              ${input.reminderMinutes ?? null}, 'manual')`;
+    if (input.reminderMinutes != null) {
+      const fireAt = new Date(new Date(input.startAt).getTime() - input.reminderMinutes * 60_000);
+      if (fireAt > new Date()) {
+        await this.schedule(fireAt, "executeReminder" as keyof this, { eventId: id });
+      }
+    }
+    return { id, title: input.title.trim(), startAt: input.startAt };
+  }
+
+  @callable()
+  async updateCalendarEvent(
+    eventId: string,
+    input: {
+      title?: string; startAt?: string; endAt?: string; allDay?: boolean;
+      location?: string; description?: string; reminderMinutes?: number | null;
+    }
+  ): Promise<{ ok: true }> {
+    const exists = this.sql<{ id: string }>`SELECT id FROM calendar_events WHERE id = ${eventId}`;
+    if (exists.length === 0) throw new Error("Event not found");
+    if (input.title !== undefined) this.sql`UPDATE calendar_events SET title = ${input.title.trim()} WHERE id = ${eventId}`;
+    if (input.startAt !== undefined) this.sql`UPDATE calendar_events SET start_at = ${input.startAt} WHERE id = ${eventId}`;
+    if (input.endAt !== undefined) this.sql`UPDATE calendar_events SET end_at = ${input.endAt} WHERE id = ${eventId}`;
+    if (input.allDay !== undefined) this.sql`UPDATE calendar_events SET all_day = ${input.allDay ? 1 : 0} WHERE id = ${eventId}`;
+    if (input.location !== undefined) this.sql`UPDATE calendar_events SET location = ${input.location} WHERE id = ${eventId}`;
+    if (input.description !== undefined) this.sql`UPDATE calendar_events SET description = ${input.description} WHERE id = ${eventId}`;
+    if (input.reminderMinutes !== undefined) {
+      this.sql`UPDATE calendar_events SET reminder_minutes = ${input.reminderMinutes}, reminder_delivered = 0 WHERE id = ${eventId}`;
+    }
+    this.sql`UPDATE calendar_events SET updated_at = datetime('now') WHERE id = ${eventId}`;
+    if (input.startAt !== undefined || input.reminderMinutes !== undefined) {
+      const evt = this.sql<{ start_at: string; reminder_minutes: number | null }>`
+        SELECT start_at, reminder_minutes FROM calendar_events WHERE id = ${eventId}`;
+      if (evt.length > 0 && evt[0].reminder_minutes != null) {
+        const fireAt = new Date(new Date(evt[0].start_at).getTime() - evt[0].reminder_minutes * 60_000);
+        if (fireAt > new Date()) {
+          await this.schedule(fireAt, "executeReminder" as keyof this, { eventId });
+        }
+      }
+    }
+    return { ok: true };
+  }
+
+  @callable()
+  async deleteCalendarEvent(eventId: string): Promise<{ ok: true }> {
+    const exists = this.sql<{ id: string }>`SELECT id FROM calendar_events WHERE id = ${eventId}`;
+    if (exists.length === 0) throw new Error("Event not found");
+    this.sql`DELETE FROM calendar_events WHERE id = ${eventId}`;
+    return { ok: true };
+  }
+
+  // ───────────────────────── Wipe account (RPC @callable) ─────────────────────────
+
+  @callable()
+  async wipeAccount(): Promise<{ ok: true; wiped: true }> {
+    // Note: table names must be literals (SQL tagged templates parameterize values, not identifiers)
+    try { this.sql`DELETE FROM sessions`; } catch { /* table may not exist */ }
+    try { this.sql`DELETE FROM session_messages`; } catch { /* */ }
+    try { this.sql`DELETE FROM notes`; } catch { /* */ }
+    try { this.sql`DELETE FROM calendar_events`; } catch { /* */ }
+    try { this.sql`DELETE FROM skills`; } catch { /* */ }
+    try { this.sql`DELETE FROM cron_jobs`; } catch { /* */ }
+    try { this.sql`DELETE FROM audit_log`; } catch { /* */ }
+    try { this.sql`DELETE FROM doc_context`; } catch { /* */ }
+    try { this.sql`DELETE FROM hub_installed`; } catch { /* */ }
+    try { this.sql`DELETE FROM todos`; } catch { /* */ }
+    this.sql`UPDATE prompt_memory SET content = '', updated_at = datetime('now')`;
+    this.sql`DELETE FROM agent_config`;
+    this.sql`DELETE FROM cf_ai_chat_agent_messages`;
+    const safeId = this.#userId.replace(/[^a-zA-Z0-9_-]/g, "");
+    if (safeId) {
+      try {
+        for (const prefix of [`${safeId}/docs/`, `${safeId}/audio/`, `${safeId}/images/`, `${safeId}/skills/`]) {
+          const listed = await this.env.MEMORIES.list({ prefix, limit: 1000 });
+          if (listed.objects.length > 0) {
+            await this.env.MEMORIES.delete(listed.objects.map((o) => o.key));
+          }
+        }
+        await this.env.MEMORIES.delete(`${safeId}/MEMORY.md`).catch(() => {});
+        await this.env.MEMORIES.delete(`${safeId}/USER.md`).catch(() => {});
+      } catch { /* R2 may be unavailable */ }
+      try {
+        const skillsList = await this.env.SKILLS.list({ prefix: `${safeId}/`, limit: 1000 });
+        if (skillsList.objects.length > 0) {
+          await this.env.SKILLS.delete(skillsList.objects.map((o) => o.key));
+        }
+      } catch { /* R2 may be unavailable */ }
+    }
+    // Vectorize purge — Vectorize has no deleteByFilter so we query by userId + batch-delete ids
+    if (this.env.VECTORS) {
+      try {
+        const { deleteUserVectors } = await import("./memory/vector-search.js");
+        await deleteUserVectors(this.env.AI, this.env.VECTORS, this.#userId);
+      } catch { /* non-fatal */ }
+    }
+    this.#sessionId = null;
+    this.#cachedSystemPrompt = null;
+    this.#cachedInferenceConfig = null;
+    logAudit(this.sql.bind(this), "session.delete_all", "account wipe");
+    return { ok: true, wiped: true };
+  }
+
+  // ───────────────────────── Vector backfill (RPC @callable) ─────────────────────────
+
+  /**
+   * Called by the BackfillVectorsWorkflow to stream message batches for embedding.
+   * Bypasses the normal tool-search path — this is a raw dump of session_messages ordered by id.
+   */
+  @callable()
+  async fetchMessagesForBackfill(offset: number, limit: number): Promise<Array<{ id: number; sessionId: string; role: string; content: string }>> {
+    const rows = this.sql<{ id: number; session_id: string; role: string; content: string }>`
+      SELECT id, session_id, role, content FROM session_messages
+      ORDER BY id ASC LIMIT ${limit} OFFSET ${offset}
+    `;
+    return rows.map((r) => ({ id: r.id, sessionId: r.session_id, role: r.role, content: r.content }));
+  }
+
+  /**
+   * Kick off a one-shot backfill Workflow that embeds every message in this user's DO.
+   * Returns immediately with the workflow instance id; progress is observable via
+   * `wrangler workflows instances describe backfill-vectors-workflow <id>`.
+   */
+  @callable()
+  async startBackfillVectors(batchSize?: number): Promise<{ workflowId: string }> {
+    if (!this.env.BACKFILL_VECTORS_WORKFLOW) {
+      throw new Error("BACKFILL_VECTORS_WORKFLOW binding missing");
+    }
+    const workflowId = `backfill-${this.#userId}-${Date.now()}`;
+    await this.env.BACKFILL_VECTORS_WORKFLOW.create({
+      id: workflowId,
+      params: {
+        userId: this.#userId,
+        batchSize: batchSize ?? 50,
+        startOffset: 0,
+      },
+    });
+    logAudit(this.sql.bind(this), "vector.backfill_start", workflowId);
+    return { workflowId };
+  }
+
+  // ───────────────────────── Delegate completion callback (RPC @callable) ─────────────────────────
+
+  /**
+   * Called by `DelegateWorkflow` via cross-worker RPC when a delegated task finishes.
+   *
+   * Flow (hermes-agent notify_on_complete pattern — PR #5779):
+   * 1. Update the `pending_delegates` row
+   * 2. Inject a synthetic system message into `session_messages` so the next parent turn
+   *    sees the result in its context, without needing to block on the delegate
+   * 3. Mirror the summary to FTS5 so it becomes searchable like any other message
+   * 4. Push a WebSocket message so the live dashboard reflects completion immediately
+   *
+   * Crucially, this does NOT re-trigger a parent LLM turn. The user will get the result
+   * whenever they next say something — the synthetic system message gives the model full
+   * context at that point.
+   */
+  @callable()
+  async onDelegateComplete(result: {
+    id: string;
+    sessionId: string;
+    status: "success" | "error";
+    summary: string;
+    toolTrace: string[];
+    durationSeconds: number;
+    tokensIn: number;
+    tokensOut: number;
+  }): Promise<{ ok: true }> {
+    const { id, sessionId, status, summary, toolTrace, durationSeconds, tokensIn, tokensOut } = result;
+
+    // 1. Update pending_delegates row (may not exist if the DO was wiped between create and complete)
+    this.sql`UPDATE pending_delegates
+      SET status = ${status}, summary = ${summary}, tool_trace = ${JSON.stringify(toolTrace)},
+          tokens_in = ${tokensIn}, tokens_out = ${tokensOut},
+          duration_seconds = ${durationSeconds}, completed_at = datetime('now')
+      WHERE id = ${id}`;
+
+    // 2. Look up the goal so the injected message has context
+    const row = this.sql<{ goal: string }>`SELECT goal FROM pending_delegates WHERE id = ${id}`;
+    const goal = row[0]?.goal ?? "(unknown goal)";
+
+    // 3. Inject synthetic system message into the session history
+    const tag = status === "success" ? "completed" : "failed";
+    const toolList = toolTrace.length > 0 ? ` (${toolTrace.join(", ")})` : "";
+    const content = `[Delegate ${tag} in ${durationSeconds}s${toolList}]\nGoal: ${goal}\n\n${summary}`;
+    this.sql`INSERT INTO session_messages (session_id, role, content) VALUES (${sessionId}, ${"system"}, ${content})`;
+
+    // 4. Track tokens + report usage (queue-backed)
+    if (tokensIn > 0 || tokensOut > 0) {
+      const { trackAuxiliaryUsage } = await import("./pipeline.js");
+      trackAuxiliaryUsage(
+        this.sql.bind(this), sessionId, tokensIn, tokensOut,
+        "delegate-workflow", this.env, this.#userId,
+      );
+    }
+
+    // 5. Remove from pendingDelegates live state and broadcast
+    this.setState({
+      ...this.state,
+      pendingDelegates: this.state.pendingDelegates.filter((d) => d.id !== id),
+    });
+
+    // 6. Push to any connected WebSocket so the frontend sees it live
+    for (const ws of this.ctx.getWebSockets()) {
+      try {
+        ws.send(JSON.stringify({
+          type: "delegate_result",
+          id,
+          status,
+          goal,
+          summary,
+          durationSeconds,
+        }));
+      } catch { /* socket closed */ }
+    }
+
+    logAudit(this.sql.bind(this), "delegate.complete", `${id}:${status}`);
+    return { ok: true };
+  }
+
   // ───────────────────────── Hub Skills Auto-Update (daily) ─────────────────────────
 
   async executeSkillUpdateCheck(): Promise<void> {
@@ -1343,124 +1541,9 @@ export class ClopinetteAgent extends AIChatAgent<Env, AgentState> {
           }
           break;
         }
-        case "usageReport": {
-          if (!this.env.GATEWAY_URL) break;
-          await fetch(`${this.env.GATEWAY_URL}/internal/usage`, {
-            method: "POST",
-            headers: {
-              "Content-Type": "application/json",
-              "x-internal-key": this.env.GATEWAY_INTERNAL_KEY ?? this.env.WS_SIGNING_SECRET,
-            },
-            body: JSON.stringify({
-              userId: task.userId,
-              tokensIn: task.tokensIn,
-              tokensOut: task.tokensOut,
-              model: task.model,
-              sessionId: task.sessionId,
-            }),
-          });
-          break;
-        }
         case "r2ContextUpdate": {
           const { updateContext } = await import("./media/handler.js");
           await updateContext(this.env.MEMORIES, task.r2Key, task.context);
-          break;
-        }
-        case "moaRequest": {
-          const { generateText } = await import("ai");
-          const { createWorkersAI } = await import("workers-ai-provider");
-          const { trackAuxiliaryUsage } = await import("./pipeline.js");
-
-          const workersai = createWorkersAI({ binding: this.env.AI });
-          const prompt = task.context
-            ? `${task.context}\n\nQuestion: ${task.question}`
-            : task.question;
-
-          const MODELS = ["@cf/qwen/qwen-3-8b", "@cf/google/gemma-3-12b-it"] as const;
-          console.log(`[moa-async] Starting ${MODELS.length} models`);
-
-          const settled = await Promise.allSettled(
-            MODELS.map(async (modelId) => {
-              const result = await generateText({
-                model: workersai(modelId),
-                messages: [{ role: "user", content: prompt }],
-                maxRetries: 1,
-              });
-              trackAuxiliaryUsage(
-                this.sql.bind(this), task.sessionId,
-                result.usage?.inputTokens ?? 0, result.usage?.outputTokens ?? 0,
-                modelId, this.env, task.userId,
-              );
-              return { model: modelId, response: result.text, success: true };
-            }),
-          );
-
-          const results = settled.map((s, i) =>
-            s.status === "fulfilled" ? s.value
-              : { model: MODELS[i], response: `Error: ${s.reason}`, success: false },
-          );
-          const successful = results.filter((r) => r.success && r.response);
-          console.log(`[moa-async] ${successful.length}/${MODELS.length} succeeded`);
-
-          if (successful.length === 0) {
-            console.warn("[moa-async] All models failed");
-            break;
-          }
-
-          // Aggregation — use Qwen (faster than Kimi for aggregation)
-          const responsesBlock = successful
-            .map((r, i) => `${i + 1}. [${r.model}]\n${r.response}`).join("\n\n");
-          const aggregation = await generateText({
-            model: workersai("@cf/qwen/qwen-3-8b"),
-            system: `You received answers from multiple AI models. Synthesize them into a single, high-quality response. Be critical — some answers may be wrong.\n\nResponses:\n\n${responsesBlock}`,
-            messages: [{ role: "user", content: task.question }],
-            maxRetries: 1,
-          });
-          trackAuxiliaryUsage(
-            this.sql.bind(this), task.sessionId,
-            aggregation.usage?.inputTokens ?? 0, aggregation.usage?.outputTokens ?? 0,
-            "moa-aggregator", this.env, task.userId,
-          );
-
-          // Deliver result
-          const moaResult = `**Mixture of Agents** (${successful.length} models)\n\n${aggregation.text}`;
-          // Push to WebSocket
-          for (const ws of this.ctx.getWebSockets()) {
-            ws.send(JSON.stringify({ type: "moa_result", content: moaResult }));
-          }
-          // Deliver to Telegram — resolve chatId from KV link
-          const lastSession = this.sql<{ platform: string }>`
-            SELECT platform FROM sessions WHERE id = ${task.sessionId}`;
-          const moaPlatform = lastSession[0]?.platform;
-
-          // Deliver to platform — resolve chatId/channelId from KV link
-          if (moaPlatform && moaPlatform !== "websocket") {
-            const prefix = moaPlatform === "telegram" ? "link:tg:" : moaPlatform === "discord" ? "link:dc:" : moaPlatform === "whatsapp" ? "link:wa:" : null;
-            if (prefix) {
-              try {
-                const keys = await this.env.LINKS.list({ prefix });
-                for (const key of keys.keys) {
-                  const val = await this.env.LINKS.get(key.name);
-                  if (val === this.#userId) {
-                    const externalId = key.name.replace(prefix, "");
-                    if (moaPlatform === "telegram" && this.env.TELEGRAM_BOT_TOKEN) {
-                      await sendTelegramMessage(this.env.TELEGRAM_BOT_TOKEN, parseInt(externalId, 10), moaResult);
-                    } else if (moaPlatform === "discord" && this.env.DISCORD_TOKEN) {
-                      await sendDiscordMessage(this.env.DISCORD_TOKEN, externalId, moaResult);
-                    } else if (moaPlatform === "whatsapp" && this.env.WHATSAPP_ACCESS_TOKEN && this.env.WHATSAPP_PHONE_NUMBER_ID) {
-                      const { sendWhatsAppMessage } = await import("./gateway/whatsapp.js");
-                      await sendWhatsAppMessage(this.env.WHATSAPP_ACCESS_TOKEN, this.env.WHATSAPP_PHONE_NUMBER_ID, externalId, moaResult);
-                    }
-                    console.log(`[moa-async] Sent to ${moaPlatform} externalId=${externalId}`);
-                    break;
-                  }
-                }
-              } catch (err) {
-                console.warn("[moa-async] KV lookup failed:", err);
-              }
-            }
-          }
-          console.log("[moa-async] Result delivered");
           break;
         }
         default:
@@ -1479,8 +1562,8 @@ export class ClopinetteAgent extends AIChatAgent<Env, AgentState> {
     await this.ctx.blockConcurrencyWhile(async () => {
       if (this.#sessionId) return; // double-check after acquiring lock
 
-      const recent = this.sql<{ id: string; updated_at: string | null; started_at: string }>`
-        SELECT id, updated_at, started_at FROM sessions WHERE platform = ${platform}
+      const recent = this.sql<{ id: string; updated_at: string | null; started_at: string; summary: string | null; total_tokens: number }>`
+        SELECT id, updated_at, started_at, summary, total_tokens FROM sessions WHERE platform = ${platform}
         ORDER BY started_at DESC LIMIT 1
       `;
 
@@ -1490,6 +1573,13 @@ export class ClopinetteAgent extends AIChatAgent<Env, AgentState> {
           await this.#autoResetSession(recent[0].id, platform);
         } else {
           this.#sessionId = recent[0].id;
+          this.setState({
+            ...this.state,
+            currentSessionId: recent[0].id,
+            currentSessionTitle: recent[0].summary,
+            tokensThisSession: recent[0].total_tokens,
+            platform,
+          });
         }
       }
 
@@ -1501,6 +1591,13 @@ export class ClopinetteAgent extends AIChatAgent<Env, AgentState> {
         // Reset compression state for new session to prevent cross-session summary leaks
         const { resetCompressionState } = await import("./compression.js");
         resetCompressionState();
+        this.setState({
+          ...this.state,
+          currentSessionId: this.#sessionId,
+          currentSessionTitle: null,
+          tokensThisSession: 0,
+          platform,
+        });
       }
     });
   }
@@ -1763,6 +1860,25 @@ export class ClopinetteAgent extends AIChatAgent<Env, AgentState> {
       created_at TEXT DEFAULT (datetime('now')),
       updated_at TEXT DEFAULT (datetime('now'))
     )`;
+
+    // Async delegation tracking — rows created by delegate-tool when a workflow starts,
+    // updated by onDelegateComplete RPC callback. Results are injected as a system message
+    // at the next parent turn (hermes notify_on_complete pattern).
+    this.sql`CREATE TABLE IF NOT EXISTS pending_delegates (
+      id TEXT PRIMARY KEY,
+      session_id TEXT NOT NULL,
+      goal TEXT NOT NULL,
+      context TEXT,
+      status TEXT NOT NULL DEFAULT 'queued',
+      summary TEXT,
+      tool_trace TEXT,
+      tokens_in INTEGER NOT NULL DEFAULT 0,
+      tokens_out INTEGER NOT NULL DEFAULT 0,
+      duration_seconds INTEGER NOT NULL DEFAULT 0,
+      created_at TEXT DEFAULT (datetime('now')),
+      completed_at TEXT
+    )`;
+    this.sql`CREATE INDEX IF NOT EXISTS idx_pending_delegates_session ON pending_delegates(session_id, status)`;
 
     // Platform message ID for ✍️ reaction-to-note lookup (Telegram, WhatsApp, etc.)
     try { this.sql`ALTER TABLE session_messages ADD COLUMN platform_msg_id INTEGER`; } catch { /* already exists */ }

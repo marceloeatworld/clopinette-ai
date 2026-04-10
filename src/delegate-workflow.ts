@@ -1,4 +1,4 @@
-import { DurableObject } from "cloudflare:workers";
+import { WorkflowEntrypoint, type WorkflowEvent, type WorkflowStep } from "cloudflare:workers";
 import { generateText, stepCountIs } from "ai";
 import { createWorkersAI } from "workers-ai-provider";
 import { createWebTool } from "./tools/web-tool.js";
@@ -8,13 +8,28 @@ import {
   DELEGATE_MAX_DEPTH,
   DELEGATE_MAX_STEPS,
 } from "./config/constants.js";
-import type { DelegateResult } from "./config/types.js";
 import type { ToolContext } from "./tools/registry.js";
 
-interface DelegateRequest {
+/**
+ * Async delegation via Cloudflare Workflows.
+ *
+ * Replaces the ephemeral `DelegateWorker` Durable Object. Benefits:
+ * - Durable, retry-safe steps (inference retries on 429/529 without losing progress)
+ * - No parent DO blocking — results are pushed back via RPC on `onDelegateComplete`
+ * - Fault isolation — one workflow crash doesn't take down siblings in a batch
+ * - Observable via `wrangler workflows instances list delegate-workflow`
+ *
+ * Pattern: hermes-agent `notify_on_complete` (NousResearch PR #5779).
+ * The parent DO never polls; the workflow calls back when done and the result
+ * is injected as a system message in the next parent turn.
+ */
+export interface DelegateWorkflowParams {
+  id: string;             // Shared with the pending_delegates.id row in the parent DO
   goal: string;
   context?: string;
   depth: number;
+  userId: string;         // Parent DO name
+  sessionId: string;      // Parent session the result gets injected into
 }
 
 const DELEGATE_SYSTEM_PROMPT = `You are a focused research sub-agent. You have a STRICT budget of 2 tool calls.
@@ -27,35 +42,58 @@ Rules:
 
 Provide a clear, concise summary of what you found.`;
 
-/**
- * Lightweight ephemeral DO for delegated sub-tasks.
- * No SQLite, no lifecycle hooks, no memory — just inference + stateless tools.
- */
-export class DelegateWorker extends DurableObject<Env> {
-  async fetch(request: Request): Promise<Response> {
-    if (request.method !== "POST") {
-      return new Response("Method not allowed", { status: 405 });
-    }
+interface InferenceOutcome {
+  status: "success" | "error";
+  summary: string;
+  toolTrace: string[];
+  tokensIn: number;
+  tokensOut: number;
+  durationSeconds: number;
+}
 
-    const { goal, context, depth } = await request.json<DelegateRequest>();
+export class DelegateWorkflow extends WorkflowEntrypoint<Env, DelegateWorkflowParams> {
+  async run(event: WorkflowEvent<DelegateWorkflowParams>, step: WorkflowStep): Promise<InferenceOutcome> {
+    const { id, goal, context, depth, userId, sessionId } = event.payload;
 
+    // Depth guard — refuse sub-delegation beyond the max depth without spending any tokens
     if (depth >= DELEGATE_MAX_DEPTH) {
-      return Response.json({
+      const outcome: InferenceOutcome = {
         status: "error",
         summary: "Maximum delegation depth reached.",
         toolTrace: [],
-        duration: 0,
-        tokens: { input: 0, output: 0 },
-      } satisfies DelegateResult);
+        tokensIn: 0,
+        tokensOut: 0,
+        durationSeconds: 0,
+      };
+      await this.#notifyParent(step, id, sessionId, userId, outcome);
+      return outcome;
     }
 
+    // Step 1: run the LLM + tools in a durable, retry-safe step
+    const outcome = await step.do(
+      "run_inference",
+      {
+        retries: { limit: 3, delay: "5 seconds", backoff: "exponential" },
+        timeout: "5 minutes",
+      },
+      async () => this.#runInference(goal, context),
+    );
+
+    // Step 2: notify the parent DO via RPC — separate step so a failed notify retries
+    // without re-running the expensive inference above
+    await this.#notifyParent(step, id, sessionId, userId, outcome);
+
+    return outcome;
+  }
+
+  async #runInference(goal: string, context?: string): Promise<InferenceOutcome> {
     const start = Date.now();
     const toolTrace: string[] = [];
 
     try {
       const model = createWorkersAI({ binding: this.env.AI })(DEFAULT_MODEL);
 
-      // Build minimal stateless tools — no sql, no r2 writes
+      // Stateless tool context — no SQLite, no R2 writes, no memory
       const minimalCtx: ToolContext = {
         sql: (() => []) as unknown as ToolContext["sql"],
         r2Memories: null as unknown as R2Bucket,
@@ -63,7 +101,7 @@ export class DelegateWorker extends DurableObject<Env> {
         ai: this.env.AI,
         userId: "delegate",
         sessionId: "delegate",
-        env: { WS_SIGNING_SECRET: "" },
+        env: { WS_SIGNING_SECRET: this.env.WS_SIGNING_SECRET },
         cfAccountId: this.env.CF_ACCOUNT_ID,
         cfBrowserToken: this.env.CF_BROWSER_TOKEN,
         searxngUrl: this.env.SEARXNG_URL,
@@ -71,8 +109,6 @@ export class DelegateWorker extends DurableObject<Env> {
         playwrightMcp: this.env.PlaywrightMCP,
       };
 
-      // Only stateless tools — no sql, no r2 writes.
-      // docs omitted: requires R2 bucket + SQLite, both null in delegate context.
       const tools: Record<string, unknown> = {
         web: createWebTool(
           minimalCtx.cfAccountId,
@@ -84,7 +120,7 @@ export class DelegateWorker extends DurableObject<Env> {
         ...(minimalCtx.playwrightMcp ? { browser: createBrowserTool(minimalCtx) } : {}),
       };
 
-      // Wrap tools: trace + dedup + budget pressure
+      // Dedup + trace wrapper
       const dedupCache = new Map<string, { result: unknown; ts: number }>();
       let stepCount = 0;
       const tracedTools = Object.fromEntries(
@@ -97,16 +133,14 @@ export class DelegateWorker extends DurableObject<Env> {
                 ?? (args as Record<string, unknown>)?.action ?? "";
               toolTrace.push(`${name}(${String(preview).slice(0, 60)})`);
 
-              // Dedup: same tool+args within 5s → cached result
               const dedupKey = `${name}:${JSON.stringify(args)}`;
               const cached = dedupCache.get(dedupKey);
-              if (cached && Date.now() - cached.ts < 5000) return cached.result;
+              if (cached && Date.now() - cached.ts < 2000) return cached.result;
 
               const result = await t.execute(args);
               dedupCache.set(dedupKey, { result, ts: Date.now() });
               stepCount++;
 
-              // Budget pressure for sub-agents (fires after step 2 of 3)
               const pct = stepCount / DELEGATE_MAX_STEPS;
               if (pct >= 0.5 && typeof result === "object" && result !== null) {
                 return { ...result, _budget: "CRITICAL: You have used most of your steps. Respond NOW with what you have." };
@@ -132,27 +166,49 @@ export class DelegateWorker extends DurableObject<Env> {
         maxRetries: 1,
       });
 
-      const duration = Math.round((Date.now() - start) / 1000);
-
-      return Response.json({
+      return {
         status: "success",
         summary: result.text || "No response generated.",
         toolTrace,
-        duration,
-        tokens: {
-          input: result.usage?.inputTokens ?? 0,
-          output: result.usage?.outputTokens ?? 0,
-        },
-      } satisfies DelegateResult);
+        tokensIn: result.usage?.inputTokens ?? 0,
+        tokensOut: result.usage?.outputTokens ?? 0,
+        durationSeconds: Math.round((Date.now() - start) / 1000),
+      };
     } catch (err) {
-      const duration = Math.round((Date.now() - start) / 1000);
-      return Response.json({
+      return {
         status: "error",
         summary: `Delegation failed: ${err instanceof Error ? err.message : String(err)}`,
         toolTrace,
-        duration,
-        tokens: { input: 0, output: 0 },
-      } satisfies DelegateResult);
+        tokensIn: 0,
+        tokensOut: 0,
+        durationSeconds: Math.round((Date.now() - start) / 1000),
+      };
     }
+  }
+
+  async #notifyParent(
+    step: WorkflowStep,
+    id: string,
+    sessionId: string,
+    userId: string,
+    outcome: InferenceOutcome,
+  ): Promise<void> {
+    await step.do(
+      "notify_parent",
+      { retries: { limit: 3, delay: "2 seconds", backoff: "exponential" }, timeout: "30 seconds" },
+      async () => {
+        const stub = this.env.CLOPINETTE_AGENT.get(this.env.CLOPINETTE_AGENT.idFromName(userId));
+        await stub.onDelegateComplete({
+          id,
+          sessionId,
+          status: outcome.status,
+          summary: outcome.summary,
+          toolTrace: outcome.toolTrace,
+          durationSeconds: outcome.durationSeconds,
+          tokensIn: outcome.tokensIn,
+          tokensOut: outcome.tokensOut,
+        });
+      },
+    );
   }
 }

@@ -30,7 +30,9 @@ export type AuditAction =
   | "hub.uninstall"
   | "hub.auto-update"
   | "session.delete"
-  | "session.delete_all";
+  | "session.delete_all"
+  | "delegate.complete"
+  | "vector.backfill_start";
 
 export function logAudit(
   sql: SqlFn,

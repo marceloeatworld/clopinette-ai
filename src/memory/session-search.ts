@@ -1,14 +1,24 @@
 import { SQL_MAX_CONTENT_LENGTH } from "../config/constants.js";
 import type { SessionMessageRow } from "../config/types.js";
+import { upsertMessageVector, searchSessionsHybrid } from "./vector-search.js";
 
 import type { SqlFn } from "../config/sql.js";
 
 /**
- * Layer 2: Session Search — FTS5 episodic recall.
+ * Layer 2: Session Search — FTS5 + Vectorize hybrid episodic recall.
  *
- * Messages are mirrored to `session_messages` table on every turn.
- * FTS5 triggers keep the search index in sync automatically.
+ * Messages are mirrored to `session_messages` on every turn. FTS5 triggers
+ * keep the keyword index in sync automatically. When a Vectorize binding is
+ * available, we also embed each message (fire-and-forget via `waitUntil`)
+ * and upsert it into the vector index for semantic recall.
  */
+
+export interface MirrorVectorCtx {
+  ai: Ai;
+  vectors: VectorizeIndex;
+  userId: string;
+  waitUntil: (promise: Promise<unknown>) => void;
+}
 
 export function mirrorMessage(
   sql: SqlFn,
@@ -16,7 +26,8 @@ export function mirrorMessage(
   role: "user" | "assistant" | "tool" | "system",
   content: string,
   toolCallId?: string,
-  toolName?: string
+  toolName?: string,
+  vectorCtx?: MirrorVectorCtx,
 ): void {
   // Truncate to stay under 100KB SQL statement limit
   const truncated =
@@ -26,6 +37,22 @@ export function mirrorMessage(
 
   sql`INSERT INTO session_messages (session_id, role, content, tool_call_id, tool_name)
       VALUES (${sessionId}, ${role}, ${truncated}, ${toolCallId ?? null}, ${toolName ?? null})`;
+
+  if (vectorCtx) {
+    const inserted = sql<{ id: number }>`SELECT last_insert_rowid() as id`;
+    const messageId = inserted[0]?.id;
+    if (messageId && messageId > 0) {
+      vectorCtx.waitUntil(
+        upsertMessageVector(vectorCtx.ai, vectorCtx.vectors, {
+          messageId,
+          userId: vectorCtx.userId,
+          sessionId,
+          role,
+          content: truncated,
+        }),
+      );
+    }
+  }
 }
 
 export interface SearchResult {
@@ -93,16 +120,26 @@ export interface GroupedSearchResult {
   matches: GroupedMatch[];
 }
 
+export interface GroupedSearchCtx {
+  ai: Ai;
+  vectors: VectorizeIndex | undefined;
+  userId: string;
+}
+
 /**
  * Search with results grouped by session and enriched with ±1 context messages.
- * Returns top N sessions ranked by best FTS5 match within each session.
+ * Uses hybrid FTS5 + Vectorize RRF when a vector context is provided, otherwise
+ * falls back to FTS5 only.
  */
-export function searchSessionsGrouped(
+export async function searchSessionsGrouped(
   sql: SqlFn,
   query: string,
-  limit = 5
-): GroupedSearchResult[] {
-  const raw = searchSessions(sql, query, limit * 3);
+  limit = 5,
+  vectorCtx?: GroupedSearchCtx,
+): Promise<GroupedSearchResult[]> {
+  const raw = vectorCtx
+    ? await searchSessionsHybrid(sql, vectorCtx.ai, vectorCtx.vectors, vectorCtx.userId, query, limit * 3)
+    : searchSessions(sql, query, limit * 3);
   if (raw.length === 0) return [];
 
   // Group by session, track best rank per session

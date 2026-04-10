@@ -89,7 +89,7 @@ export async function buildSystemPrompt(ctx: PromptContext): Promise<string> {
   if (ctx.codemodeEnabled) {
     blocks.push(CODEMODE_GUIDANCE);
   }
-  if (ctx.env.DELEGATE_WORKER) {
+  if (ctx.env.DELEGATE_WORKFLOW) {
     blocks.push(DELEGATION_GUIDANCE);
   }
 

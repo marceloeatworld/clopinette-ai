@@ -1,3 +1,13 @@
+/** Usage report message — produced by the core worker, consumed by the gateway queue handler. */
+interface UsageMessage {
+  userId: string;
+  tokensIn: number;
+  tokensOut: number;
+  model: string;
+  sessionId: string;
+  timestamp: number;
+}
+
 interface Env {
   AI: Ai;
   BROWSER: Fetcher;
@@ -15,8 +25,14 @@ interface Env {
   // Gateway URL for usage reporting (fire-and-forget after each response)
   GATEWAY_URL?: string;
   GATEWAY_INTERNAL_KEY?: string;
-  // Delegation — ephemeral sub-agent DOs for parallel task execution
-  DELEGATE_WORKER?: DurableObjectNamespace;
+  // Delegation — Cloudflare Workflow (async, durable, retry-safe per step)
+  DELEGATE_WORKFLOW: Workflow<import("./delegate-workflow.js").DelegateWorkflowParams>;
+  // Vector backfill — one-shot Workflow to hydrate existing messages into Vectorize
+  BACKFILL_VECTORS_WORKFLOW: Workflow<import("./backfill-workflow.js").BackfillParams>;
+  // Vectorize — hybrid semantic search over session history (bge-m3, 1024-d, cosine)
+  VECTORS: VectorizeIndex;
+  // Queue — reliable usage reports to the gateway (replaces fire-and-forget /internal/usage)
+  USAGE_QUEUE: Queue<UsageMessage>;
   // Dynamic Workers (codemode) — opt-in, requires Workers Paid plan
   LOADER?: WorkerLoader;
   // Codemode outbound — SSRF-safe fetch proxy for sandbox code (service binding)

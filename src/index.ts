@@ -1,22 +1,20 @@
 import { Hono } from "hono";
 import { cors } from "hono/cors";
 import { agentsMiddleware } from "hono-agents";
-import { getAgentByName } from "agents";
-import type { ConfigRequest, SetupRequest } from "./config/types.js";
 import { authMiddleware } from "./enterprise/auth.js";
 import { registerTelegramWebhook, deleteTelegramWebhook, sendTelegramMessage } from "./gateway/telegram.js";
 import { sendWhatsAppMessage } from "./gateway/whatsapp.js";
 import { registerDiscordCommands, sendDiscordMessage } from "./gateway/discord.js";
 import { timingSafeEqual } from "./enterprise/safe-compare.js";
-import type { ClopinetteAgent } from "./agent.js";
 
 // Module-level cache for bot secret (never changes during deployment)
 let cachedBotSecret: string | null = null;
 
-// Re-export DO classes for wrangler discovery
+// Re-export DO and Workflow classes for wrangler discovery
 export { ClopinetteAgent } from "./agent.js";
 export { PlaywrightMCP } from "./playwright-mcp.js";
-export { DelegateWorker } from "./delegate-worker.js";
+export { DelegateWorkflow } from "./delegate-workflow.js";
+export { BackfillVectorsWorkflow } from "./backfill-workflow.js";
 
 type HonoEnv = { Bindings: Env };
 const app = new Hono<HonoEnv>();
@@ -38,10 +36,6 @@ app.use("*", agentsMiddleware());
 app.use("/api/*", authMiddleware());
 
 // ───────────────────────── Helpers ─────────────────────────
-
-async function getAgent(env: Env, userId: string) {
-  return getAgentByName<Env, ClopinetteAgent>(env.CLOPINETTE_AGENT, userId);
-}
 
 /** KV keys (platform-agnostic) */
 const kv = {
@@ -69,12 +63,17 @@ interface QuotaCache {
   updatedAt: number;
 }
 
-const QUOTA_STALENESS_MS = 5 * 60_000; // 5 minutes
+/**
+ * Aligned with the gateway's KV TTL (10 min) — the gateway cron also refreshes
+ * every 5 min for active users, so a "fresh" window of 10 min is always covered.
+ */
+const QUOTA_STALENESS_MS = 10 * 60_000;
 
 /**
- * Check quota from KV cache (pushed by gateway).
+ * Check quota from KV cache (pushed by gateway + periodic cron sync).
  * Falls back to gateway HTTP if cache is stale/missing.
- * Fail-open if both KV and gateway are unavailable.
+ * Fail-open if both KV and gateway are unavailable — we never block traffic
+ * on infrastructure hiccups.
  */
 async function checkQuotaFromKV(
   links: KVNamespace,
@@ -88,12 +87,12 @@ async function checkQuotaFromKV(
     try {
       const cache: QuotaCache = JSON.parse(raw);
       if (Date.now() - cache.updatedAt < QUOTA_STALENESS_MS) {
-        return cache; // Fresh cache — use directly
+        return cache;
       }
     } catch { /* malformed cache — fall through to refresh */ }
   }
 
-  // Stale or missing — try gateway refresh
+  // Absent or stale — try gateway refresh
   if (gatewayUrl && internalKey) {
     try {
       const resp = await fetch(`${gatewayUrl}/internal/quota/${userId}`, {
@@ -104,12 +103,7 @@ async function checkQuotaFromKV(
     } catch { /* gateway unreachable */ }
   }
 
-  // Fallback: use stale cache if available
-  if (raw) {
-    try { return JSON.parse(raw) as QuotaCache; } catch { /* ignore */ }
-  }
-
-  // No cache, no gateway — fail-open
+  // No fresh cache and no gateway — fail-open.
   return { allowed: true };
 }
 
@@ -133,59 +127,6 @@ async function resolveDoName(
 
   return { doName: raw, linkedUserId: raw, shared: false };
 }
-
-// ───────────────────────── API: agent management ─────────────────────────
-
-app.post("/api/setup", async (c) => {
-  const body = await c.req.json<SetupRequest>();
-  if (!body.userId) return c.json({ error: "userId required" }, 400);
-  const agent = await getAgent(c.env, body.userId);
-  const result = await agent.setup(body.displayName);
-  return c.json(result);
-});
-
-app.post("/api/config", async (c) => {
-  const body = await c.req.json<ConfigRequest>();
-  if (!body.userId) return c.json({ error: "userId required" }, 400);
-  if (body.apiKey && (!body.provider || body.provider === "workers-ai")) {
-    return c.json({ error: "apiKey requires a BYOK provider" }, 400);
-  }
-  if (body.model && !body.provider) {
-    return c.json({ error: "model requires a provider (for per-provider storage)" }, 400);
-  }
-  if (body.auxiliaryModel && !body.auxiliaryProvider && !body.provider) {
-    return c.json({ error: "auxiliaryModel requires auxiliaryProvider (or provider)" }, 400);
-  }
-  if (body.provider && !/^[a-z0-9_-]+$/.test(body.provider)) {
-    return c.json({ error: "Invalid provider slug" }, 400);
-  }
-  if (body.auxiliaryProvider && !/^[a-z0-9_-]+$/.test(body.auxiliaryProvider)) {
-    return c.json({ error: "Invalid auxiliaryProvider slug" }, 400);
-  }
-  const agent = await getAgent(c.env, body.userId);
-  if (body.provider) await agent.updateConfig("provider", body.provider, false);
-  if (body.auxiliaryProvider) await agent.updateConfig("auxiliary_provider", body.auxiliaryProvider, false);
-  if (body.model && body.provider) await agent.updateConfig(`model:${body.provider}`, body.model, false);
-  if (body.auxiliaryModel) {
-    const auxProv = body.auxiliaryProvider ?? body.provider;
-    if (auxProv) await agent.updateConfig(`auxiliary_model:${auxProv}`, body.auxiliaryModel, false);
-  }
-  if (body.apiKey && body.provider) await agent.updateConfig(`api_key:${body.provider}`, body.apiKey, true);
-  if (body.soulMd) {
-    if (body.soulMd.length > 10000) return c.json({ error: "soul_md max 10000 chars" }, 400);
-    await agent.updateConfig("soul_md", body.soulMd, false);
-  }
-  if (body.autoragName) await agent.updateConfig("autorag_name", body.autoragName, false);
-  return c.json({ ok: true });
-});
-
-app.get("/api/status", async (c) => {
-  const userId = c.req.query("userId");
-  if (!userId) return c.json({ error: "userId query param required" }, 400);
-  const agent = await getAgent(c.env, userId);
-  const status = await agent.getStatus();
-  return c.json(status);
-});
 
 // ───────────────────────── API: Telegram setup (admin) ─────────────────────────
 
@@ -254,190 +195,6 @@ app.post("/api/admin/setup-discord", async (c) => {
 app.delete("/api/admin/setup-discord", async (c) => {
   await c.env.LINKS.delete(kv.botSecret("discord"));
   return c.json({ ok: true });
-});
-
-// ───────────────────────── API: admin (memory, skills, config, audit) ─────────────────────────
-
-/** Helper: get userId from query param, return agent */
-async function getAdminAgent(c: { req: { query: (k: string) => string | undefined }; env: Env; json: (d: unknown, s?: number) => Response }) {
-  const userId = c.req.query("userId");
-  if (!userId) return null;
-  return getAgent(c.env, userId);
-}
-
-// Memory
-app.get("/api/admin/memory/:type", async (c) => {
-  const agent = await getAdminAgent(c);
-  if (!agent) return c.json({ error: "userId required" }, 400);
-  const type = c.req.param("type");
-  if (type !== "memory" && type !== "user") return c.json({ error: "type must be 'memory' or 'user'" }, 400);
-  return c.json(await agent.getMemory(type));
-});
-
-app.put("/api/admin/memory/:type", async (c) => {
-  const agent = await getAdminAgent(c);
-  if (!agent) return c.json({ error: "userId required" }, 400);
-  const type = c.req.param("type");
-  if (type !== "memory" && type !== "user") return c.json({ error: "type must be 'memory' or 'user'" }, 400);
-  const { content } = await c.req.json<{ content: string }>();
-  return c.json(await agent.setMemory(type, content));
-});
-
-// Soul
-app.get("/api/admin/soul", async (c) => {
-  const agent = await getAdminAgent(c);
-  if (!agent) return c.json({ error: "userId required" }, 400);
-  return c.json(await agent.getSoulMd());
-});
-
-app.put("/api/admin/soul", async (c) => {
-  const agent = await getAdminAgent(c);
-  if (!agent) return c.json({ error: "userId required" }, 400);
-  const { content } = await c.req.json<{ content: string }>();
-  return c.json(await agent.setSoulMd(content));
-});
-
-// Skills
-app.get("/api/admin/skills", async (c) => {
-  const agent = await getAdminAgent(c);
-  if (!agent) return c.json({ error: "userId required" }, 400);
-  return c.json(await agent.listSkillsAdmin());
-});
-
-app.get("/api/admin/skills/:name", async (c) => {
-  const agent = await getAdminAgent(c);
-  if (!agent) return c.json({ error: "userId required" }, 400);
-  const skill = await agent.getSkillAdmin(c.req.param("name"));
-  if (!skill) return c.json({ error: "Skill not found" }, 404);
-  return c.json(skill);
-});
-
-app.put("/api/admin/skills/:name", async (c) => {
-  const agent = await getAdminAgent(c);
-  if (!agent) return c.json({ error: "userId required" }, 400);
-  const body = await c.req.json<{ content: string; category?: string; description?: string; triggerPattern?: string }>();
-  return c.json(await agent.setSkillAdmin(c.req.param("name"), body.content, body));
-});
-
-app.delete("/api/admin/skills/:name", async (c) => {
-  const agent = await getAdminAgent(c);
-  if (!agent) return c.json({ error: "userId required" }, 400);
-  return c.json(await agent.deleteSkillAdmin(c.req.param("name")));
-});
-
-// Audit
-app.get("/api/admin/audit", async (c) => {
-  const agent = await getAdminAgent(c);
-  if (!agent) return c.json({ error: "userId required" }, 400);
-  const limit = Math.min(Math.max(parseInt(c.req.query("limit") ?? "50", 10) || 50, 1), 100);
-  const offset = Math.max(parseInt(c.req.query("offset") ?? "0", 10) || 0, 0);
-  return c.json(await agent.getAuditLog(limit, offset));
-});
-
-// Sessions
-app.get("/api/admin/sessions", async (c) => {
-  const agent = await getAdminAgent(c);
-  if (!agent) return c.json({ error: "userId required" }, 400);
-  const limit = Math.min(Math.max(parseInt(c.req.query("limit") ?? "20", 10) || 20, 1), 100);
-  const offset = Math.max(parseInt(c.req.query("offset") ?? "0", 10) || 0, 0);
-  return c.json(await agent.listSessions(limit, offset));
-});
-
-app.get("/api/admin/sessions/:id/messages", async (c) => {
-  const agent = await getAdminAgent(c);
-  if (!agent) return c.json({ error: "userId required" }, 400);
-  const limit = Math.min(Math.max(parseInt(c.req.query("limit") ?? "50", 10) || 50, 1), 100);
-  return c.json(await agent.getSessionMessagesAdmin(c.req.param("id"), limit));
-});
-
-app.delete("/api/admin/sessions/:id", async (c) => {
-  const agent = await getAdminAgent(c);
-  if (!agent) return c.json({ error: "userId required" }, 400);
-  return c.json(await agent.deleteSession(c.req.param("id")));
-});
-
-app.delete("/api/admin/sessions", async (c) => {
-  const agent = await getAdminAgent(c);
-  if (!agent) return c.json({ error: "userId required" }, 400);
-  return c.json(await agent.deleteAllSessions());
-});
-
-// Config
-app.get("/api/admin/config", async (c) => {
-  const agent = await getAdminAgent(c);
-  if (!agent) return c.json({ error: "userId required" }, 400);
-  return c.json(await agent.getFullConfig());
-});
-
-app.delete("/api/admin/config/:key", async (c) => {
-  const agent = await getAdminAgent(c);
-  if (!agent) return c.json({ error: "userId required" }, 400);
-  return c.json(await agent.deleteConfig(c.req.param("key")));
-});
-
-// ───────────────────────── API: skills hub ─────────────────────────
-
-app.get("/api/admin/hub/search", async (c) => {
-  const agent = await getAdminAgent(c);
-  if (!agent) return c.json({ error: "userId required" }, 400);
-  const query = c.req.query("q") ?? "";
-  const source = c.req.query("source");
-  const limit = parseInt(c.req.query("limit") ?? "10", 10);
-  return c.json(await agent.hubSearch(query, source, limit));
-});
-
-app.post("/api/admin/hub/install", async (c) => {
-  const agent = await getAdminAgent(c);
-  if (!agent) return c.json({ error: "userId required" }, 400);
-  const { source, identifier } = await c.req.json<{ source: string; identifier: string }>();
-  return c.json(await agent.hubInstall(source, identifier));
-});
-
-app.post("/api/admin/hub/install-url", async (c) => {
-  const agent = await getAdminAgent(c);
-  if (!agent) return c.json({ error: "userId required" }, 400);
-  const { url, name } = await c.req.json<{ url: string; name?: string }>();
-  return c.json(await agent.hubInstallFromUrl(url, name));
-});
-
-app.get("/api/admin/hub/installed", async (c) => {
-  const agent = await getAdminAgent(c);
-  if (!agent) return c.json({ error: "userId required" }, 400);
-  return c.json(await agent.hubListInstalled());
-});
-
-app.delete("/api/admin/hub/installed/:name", async (c) => {
-  const agent = await getAdminAgent(c);
-  if (!agent) return c.json({ error: "userId required" }, 400);
-  return c.json(await agent.hubUninstall(c.req.param("name")));
-});
-
-// ───────────────────────── API: identity linking ─────────────────────────
-
-/**
- * Link a platform identity to a userId.
- * POST /api/link { userId, code }
- */
-app.post("/api/link", async (c) => {
-  const { userId, code } = await c.req.json<{ userId: string; code: string }>();
-  if (!userId || !code) return c.json({ error: "userId and code required" }, 400);
-
-  const raw = await c.env.LINKS.get(kv.linkCode(code.toUpperCase()));
-  if (!raw) return c.json({ error: "Invalid or expired link code" }, 400);
-
-  const { platform, externalId } = JSON.parse(raw) as { platform: string; externalId: string };
-  await c.env.LINKS.put(kv.link(platform, externalId), userId);
-  await c.env.LINKS.delete(kv.linkCode(code.toUpperCase()));
-
-  // Ensure plan key exists in KV (gateway may have already written it, but be defensive)
-  const existingPlan = await c.env.LINKS.get(`plan:${userId}`);
-  if (!existingPlan) {
-    // No plan in KV — this was the bug. Can't read D1 from core worker, but
-    // the gateway's /api/link handler writes it. Log for visibility.
-    console.warn(`Link completed but no plan:${userId} in KV — gateway should sync this`);
-  }
-
-  return c.json({ ok: true, platform, externalId, userId });
 });
 
 // ───────────────────────── Webhooks ─────────────────────────

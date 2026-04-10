@@ -1,7 +1,5 @@
 import { z } from "zod";
 import { DELEGATE_MAX_BATCH } from "../config/constants.js";
-import { trackAuxiliaryUsage } from "../pipeline.js";
-import type { DelegateResult } from "../config/types.js";
 import type { ToolContext } from "./registry.js";
 
 const taskSchema = z.object({
@@ -9,14 +7,30 @@ const taskSchema = z.object({
   context: z.string().optional().describe("Relevant context from the current conversation"),
 });
 
+/**
+ * Async delegation via Cloudflare Workflows.
+ *
+ * Pattern (hermes-agent notify_on_complete, NousResearch PR #5779):
+ *   1. Create a Workflow instance per task (parallel batch with Promise.allSettled)
+ *   2. INSERT a row into `pending_delegates` so the DO knows this task is running
+ *   3. Return IMMEDIATELY with `{ status: "queued", ids }`
+ *   4. The workflow runs in the background (inference + tools)
+ *   5. On completion, the workflow calls `agent.onDelegateComplete(result)` via RPC
+ *   6. The result is injected as a system message in the next parent turn
+ *
+ * The parent agent does NOT block. The user can keep chatting; delegate results
+ * surface in context on their next message.
+ */
 export function createDelegateTool(ctx: ToolContext & { onToolProgress?: (name: string, preview: string) => void }) {
   const env = ctx.env as Env;
-  const ns = env.DELEGATE_WORKER;
-  if (!ns) throw new Error("DELEGATE_WORKER binding missing");
+  const workflow = env.DELEGATE_WORKFLOW;
+  if (!workflow) throw new Error("DELEGATE_WORKFLOW binding missing");
 
   return {
     description:
-      "Delegate independent research tasks to sub-agents that run in parallel.\n" +
+      "Delegate independent research tasks to async sub-agents that run in the background.\n" +
+      "Returns IMMEDIATELY — the user can keep chatting while sub-agents work.\n" +
+      "Results are automatically injected into the conversation when complete (next turn).\n" +
       "Sub-agents have web search and browser — they cannot write to memory.\n" +
       "Use for: parallel research on 2-3 topics, deep web research, gathering diverse info.\n" +
       "Do NOT delegate simple lookups — use web or docs directly.",
@@ -34,55 +48,60 @@ export function createDelegateTool(ctx: ToolContext & { onToolProgress?: (name: 
         ? params.tasks
         : [{ goal: params.goal!, context: params.context }];
 
-      const start = Date.now();
       const progress = ctx.onToolProgress;
 
-      const promises = taskList.map(async (task, i) => {
-        const label = taskList.length > 1 ? `[${i + 1}/${taskList.length}]` : "";
-        progress?.("delegate", `${label} Starting: ${task.goal.slice(0, 60)}`);
+      // Fault-isolated fan-out: use allSettled so one workflow creation failure
+      // doesn't nuke the whole batch (fixes the Promise.all hazard we had before).
+      const launches = await Promise.allSettled(
+        taskList.map(async (task, i) => {
+          const label = taskList.length > 1 ? `[${i + 1}/${taskList.length}]` : "";
+          progress?.("delegate", `${label} Queueing: ${task.goal.slice(0, 60)}`);
 
-        const id = ns.newUniqueId();
-        const stub = ns.get(id);
-        const res = await stub.fetch(new Request("https://delegate/execute", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ goal: task.goal, context: task.context ?? "", depth: 1 }),
-        }));
-        const result = await res.json<DelegateResult>();
+          const id = crypto.randomUUID();
 
-        // Relay child tool trace as progress
-        if (progress && result.toolTrace.length > 0) {
-          progress("delegate", `${label} Done (${result.toolTrace.join(", ")})`);
-        }
+          // Pre-INSERT the pending row so the eventual onDelegateComplete has somewhere to UPDATE.
+          // Doing this before workflow creation means the row exists even if create() races the callback.
+          ctx.sql`INSERT INTO pending_delegates (id, session_id, goal, context, status)
+            VALUES (${id}, ${ctx.sessionId}, ${task.goal}, ${task.context ?? null}, 'queued')`;
 
-        return result;
-      });
+          await workflow.create({
+            id,
+            params: {
+              id,
+              goal: task.goal,
+              context: task.context,
+              depth: 1,
+              userId: ctx.userId,
+              sessionId: ctx.sessionId,
+            },
+          });
 
-      const results = await Promise.all(promises);
-      const totalDuration = Math.round((Date.now() - start) / 1000);
+          return { id, goal: task.goal };
+        }),
+      );
 
-      // Track token usage for all sub-agents
-      for (const r of results) {
-        if (r.tokens.input > 0 || r.tokens.output > 0) {
-          trackAuxiliaryUsage(
-            ctx.sql, ctx.sessionId,
-            r.tokens.input, r.tokens.output,
-            "delegate-worker", env, ctx.userId, ctx.queueTask,
-          );
+      const queued: Array<{ id: string; goal: string }> = [];
+      const failed: Array<{ goal: string; error: string }> = [];
+      for (let i = 0; i < launches.length; i++) {
+        const launch = launches[i];
+        if (launch.status === "fulfilled") {
+          queued.push(launch.value);
+        } else {
+          failed.push({
+            goal: taskList[i].goal,
+            error: launch.reason instanceof Error ? launch.reason.message : String(launch.reason),
+          });
         }
       }
 
       return {
-        results: results.map((r, i) => ({
-          task: taskList[i].goal,
-          status: r.status,
-          summary: r.summary,
-          tools_used: r.toolTrace,
-          duration: `${r.duration}s`,
-        })),
-        total_duration: `${totalDuration}s`,
-        sub_agents: results.length,
-        _note: "Research complete. Use these summaries directly — do NOT re-search the same topics.",
+        status: "queued" as const,
+        queued: queued.map((q) => ({ id: q.id, goal: q.goal })),
+        failed: failed.length > 0 ? failed : undefined,
+        _note:
+          "Sub-agents are running in the background. Their results will appear in your context " +
+          "at the next user turn as system messages. Finish your current response and let the user " +
+          "know research is in progress — they can keep chatting in the meantime.",
       };
     },
   };

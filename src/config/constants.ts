@@ -119,9 +119,9 @@ Note: web, docs, image, tts, notes, calendar, clarify are called directly, NOT v
 export const DELEGATE_MAX_DEPTH = 2;
 export const DELEGATE_MAX_BATCH = 3;
 export const DELEGATE_MAX_STEPS = 3;
-/** Design intent: tools excluded from delegate sub-agents. Enforced by DelegateWorker's minimal tool set. */
+/** Design intent: tools excluded from delegate sub-agents. Enforced by DelegateWorkflow's minimal tool set. */
 export const DELEGATE_BLOCKED_TOOLS = new Set([
-  "delegate", "mixture_of_agents", "clarify",
+  "delegate", "clarify",
   "memory", "calendar", "tts", "image", "notes",
 ]);
 

@@ -13,11 +13,11 @@ import { ingestSummary } from "./media/ingest.js";
 import { saveTranscript, updateContext, savePdfTranscript } from "./media/handler.js";
 import {
   MAX_STEPS, DEFAULT_AGENT_IDENTITY, AUXILIARY_MODEL,
-  IMAGE_GEN_TOKEN_EQUIVALENT, TTS_TOKENS_PER_CHAR, WHISPER_TOKENS_PER_KB,
+  WHISPER_TOKENS_PER_KB,
 } from "./config/constants.js";
 import { buildSystemPrompt } from "./prompt-builder.js";
 import { getHonchoContext } from "./memory/honcho.js";
-import { mirrorMessage } from "./memory/session-search.js";
+import { mirrorMessage, type MirrorVectorCtx } from "./memory/session-search.js";
 import { compressContext } from "./compression.js";
 import { resolveTools, buildTools } from "./tools/registry.js";
 import { createModel, loadInferenceConfig, loadFallbackConfig } from "./inference/provider.js";
@@ -75,6 +75,8 @@ export interface PipelineContext {
   // Callbacks (gateway-specific side effects)
   onStateChange?: (status: "thinking" | "streaming" | "idle") => void;
   onComplete?: (result: { text: string; usage?: PipelineUsage; mediaDelivery?: MediaDelivery[] }) => void;
+  /** DO `ctx.waitUntil` — keeps fire-and-forget promises alive past the request lifecycle. */
+  waitUntil?: (promise: Promise<unknown>) => void;
   /** Queue a background task that survives DO hibernation. Falls back to fire-and-forget if not provided. */
   queueTask?: (task: BackgroundTask) => void;
   /** Request structured input from the user mid-tool-execution. Returns null if not supported. */
@@ -110,11 +112,13 @@ export interface ElicitParams {
 
 // ───────────────────────── Background Task Types ─────────────────────────
 
+/**
+ * Background tasks executed by the DO scheduler (survives hibernation).
+ * Note: usage reports go through `env.USAGE_QUEUE` now, not this queue.
+ */
 export type BackgroundTask =
   | { type: "selfLearning"; summary: string; userId: string; sessionId: string; options: { reviewMemory: boolean; reviewSkills: boolean } }
-  | { type: "usageReport"; userId: string; tokensIn: number; tokensOut: number; model: string; sessionId: string }
-  | { type: "r2ContextUpdate"; r2Key: string; context: string }
-  | { type: "moaRequest"; question: string; context?: string; userId: string; sessionId: string };
+  | { type: "r2ContextUpdate"; r2Key: string; context: string };
 
 export interface PipelineUsage {
   inputTokens: number;
@@ -143,6 +147,17 @@ export interface PipelineResultStream {
 }
 
 export type PipelineResult = PipelineResultGenerate | PipelineResultStream;
+
+/** Build the shared MirrorVectorCtx from a PipelineContext — returns undefined if the DO hasn't provided waitUntil. */
+function buildVectorCtx(ctx: PipelineContext): MirrorVectorCtx | undefined {
+  if (!ctx.waitUntil || !ctx.env.VECTORS) return undefined;
+  return {
+    ai: ctx.env.AI,
+    vectors: ctx.env.VECTORS,
+    userId: ctx.userId,
+    waitUntil: ctx.waitUntil,
+  };
+}
 
 // ───────────────────────── Text file detection ─────────────────────────
 
@@ -406,7 +421,7 @@ export async function runPipeline(
         if (preset) fastPrompt += `\n\n${preset}`;
       }
     }
-    mirrorMessage(ctx.sql, ctx.sessionId, "user", ctx.userText);
+    mirrorMessage(ctx.sql, ctx.sessionId, "user", ctx.userText, undefined, undefined, buildVectorCtx(ctx));
     ctx.onStateChange?.("streaming");
 
     // Fast path uses cheap model but KEEPS conversation history (like Hermes smart routing)
@@ -508,7 +523,7 @@ export async function runPipeline(
       didCompress = true;
       trackAuxiliaryUsage(
         ctx.sql, ctx.sessionId, compression.auxTokensIn, compression.auxTokensOut,
-        AUXILIARY_MODEL, ctx.env, ctx.userId, ctx.queueTask,
+        AUXILIARY_MODEL, ctx.env, ctx.userId,
       );
     }
   }
@@ -559,7 +574,7 @@ export async function runPipeline(
           const transcribed = await transcribeAudio(asset, ctx.env.MEMORIES, ctx.env.AI);
           if (transcribed.audioBytes) {
             const equivTokens = Math.ceil(transcribed.audioBytes / 1000) * WHISPER_TOKENS_PER_KB;
-            trackAuxiliaryUsage(ctx.sql, ctx.sessionId, equivTokens, 0, "@cf/openai/whisper-large-v3-turbo", ctx.env, ctx.userId, ctx.queueTask);
+            trackAuxiliaryUsage(ctx.sql, ctx.sessionId, equivTokens, 0, "@cf/openai/whisper-large-v3-turbo", ctx.env, ctx.userId);
           }
           if (transcribed.transcription) {
             // Save .transcript.md sidecar + update context metadata on original
@@ -719,7 +734,7 @@ export async function runPipeline(
       mirrorText = [mirrorText, ...markers].filter(Boolean).join("\n");
     }
   }
-  mirrorMessage(ctx.sql, ctx.sessionId, "user", mirrorText);
+  mirrorMessage(ctx.sql, ctx.sessionId, "user", mirrorText, undefined, undefined, buildVectorCtx(ctx));
 
   ctx.onStateChange?.("streaming");
 
@@ -838,7 +853,7 @@ export async function runPipeline(
         if (summaryTokensIn > 0 || summaryTokensOut > 0) {
           trackAuxiliaryUsage(
             ctx.sql, ctx.sessionId, summaryTokensIn, summaryTokensOut,
-            config.model, ctx.env, ctx.userId, ctx.queueTask,
+            config.model, ctx.env, ctx.userId,
           );
         }
       } catch (err) {
@@ -950,26 +965,26 @@ function extractMediaDelivery(steps: unknown): MediaDelivery[] {
 
 // ───────────────────────── Auxiliary usage tracking ─────────────────────────
 
+/**
+ * Reports token usage to the gateway via Cloudflare Queues.
+ *
+ * Durable by design:
+ * - `env.USAGE_QUEUE.send()` is awaited via ctx.waitUntil in the caller (non-blocking)
+ * - Queue retries automatically on gateway failure
+ * - Failed messages after max retries land in `clopinette-usage-dlq`
+ * - No more fire-and-forget fetch — usage events can never be silently dropped
+ */
 export function trackAuxiliaryUsage(
   sql: SqlFn, sessionId: string,
   tokensIn: number, tokensOut: number,
   model: string, env: Env, userId: string,
-  queueTask?: (task: BackgroundTask) => void,
 ): void {
   const tokens = tokensIn + tokensOut;
   if (tokens <= 0) return;
   sql`UPDATE sessions SET total_tokens = total_tokens + ${tokens} WHERE id = ${sessionId}`;
-  if (env.GATEWAY_URL) {
-    const report: BackgroundTask = { type: "usageReport", userId, tokensIn, tokensOut, model, sessionId };
-    if (queueTask) { queueTask(report); }
-    else {
-      fetch(`${env.GATEWAY_URL}/internal/usage`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json", "x-internal-key": env.GATEWAY_INTERNAL_KEY ?? env.WS_SIGNING_SECRET },
-        body: JSON.stringify(report),
-      }).catch((e) => console.warn("Usage report failed:", e));
-    }
-  }
+  env.USAGE_QUEUE.send({
+    userId, tokensIn, tokensOut, model, sessionId, timestamp: Date.now(),
+  });
 }
 
 // ───────────────────────── Post-inference (step 10) ─────────────────────────
@@ -980,9 +995,9 @@ function afterInference(
   text: string,
   usage?: { inputTokens?: number; outputTokens?: number }
 ): void {
-  // Mirror assistant response to FTS5
+  // Mirror assistant response to FTS5 + Vectorize
   if (text) {
-    mirrorMessage(ctx.sql, ctx.sessionId, "assistant", text);
+    mirrorMessage(ctx.sql, ctx.sessionId, "assistant", text, undefined, undefined, buildVectorCtx(ctx));
   }
 
   // Auto-generate session title from the first exchange (fire-and-forget)
@@ -1007,29 +1022,15 @@ function afterInference(
     ctx.sql`UPDATE sessions SET total_tokens = total_tokens + ${tokens}, updated_at = datetime('now')
       WHERE id = ${ctx.sessionId}`;
 
-    // Gateway usage reporting
-    if (ctx.env.GATEWAY_URL) {
-      const report = {
-        type: "usageReport" as const,
-        userId: ctx.userId,
-        tokensIn: usage.inputTokens ?? 0,
-        tokensOut: usage.outputTokens ?? 0,
-        model: config.model,
-        sessionId: ctx.sessionId,
-      };
-      if (ctx.queueTask) {
-        ctx.queueTask(report);
-      } else {
-        fetch(`${ctx.env.GATEWAY_URL}/internal/usage`, {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            "x-internal-key": ctx.env.GATEWAY_INTERNAL_KEY ?? ctx.env.WS_SIGNING_SECRET,
-          },
-          body: JSON.stringify(report),
-        }).catch((e) => console.warn("Usage report failed:", e));
-      }
-    }
+    // Gateway usage reporting via Cloudflare Queue (retry-safe, DLQ-backed)
+    ctx.env.USAGE_QUEUE.send({
+      userId: ctx.userId,
+      tokensIn: usage.inputTokens ?? 0,
+      tokensOut: usage.outputTokens ?? 0,
+      model: config.model,
+      sessionId: ctx.sessionId,
+      timestamp: Date.now(),
+    });
   } else {
     // No usage info but still touch the timestamp
     ctx.sql`UPDATE sessions SET updated_at = datetime('now') WHERE id = ${ctx.sessionId}`;

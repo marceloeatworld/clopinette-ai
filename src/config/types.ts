@@ -17,10 +17,33 @@ export type ProviderName =
   | "huggingface"
   | "replicate";
 
+/**
+ * Live agent state broadcast to all connected WebSocket clients via Agents SDK `setState()`.
+ *
+ * The frontend subscribes via `useAgent()` from `agents/react` and re-renders whenever
+ * any of these fields change. Values are hydrated on `onStart()` (from SQLite + KV) and
+ * updated throughout the pipeline (status transitions, token accounting, delegate status, etc).
+ */
 export interface AgentState {
+  // Runtime status
   status: "idle" | "thinking" | "streaming";
   currentModel: string;
   platform: Platform;
+
+  // Current session (updated on every session start / auto-reset)
+  currentSessionId: string | null;
+  currentSessionTitle: string | null;
+
+  // Quota (hydrated from KV `quota:{userId}` on onStart, refreshed after each usage report)
+  plan: string | null;
+  tokensThisMonth: number;
+  tokensThisSession: number;
+  quotaAllowed: boolean;
+  quotaReason?: string;
+
+  // Live activity (updated mid-pipeline)
+  activeTool: string | null;
+  pendingDelegates: Array<{ id: string; goal: string; startedAt: string }>;
 }
 
 export interface AgentConfigRow {
