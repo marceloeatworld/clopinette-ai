@@ -1,8 +1,10 @@
 import type { SqlFn } from "../config/sql.js";
+import { redact } from "./redact.js";
 
 /**
  * Append-only audit log.
  * All significant actions are logged for compliance and debugging.
+ * `details` is redacted before persistence to prevent accidental secret leakage.
  */
 
 export type AuditAction =
@@ -39,7 +41,8 @@ export function logAudit(
   action: AuditAction,
   details?: string
 ): void {
-  sql`INSERT INTO audit_log (action, details) VALUES (${action}, ${details ?? null})`;
+  const scrubbed = details != null ? redact(details) : null;
+  sql`INSERT INTO audit_log (action, details) VALUES (${action}, ${scrubbed})`;
 }
 
 

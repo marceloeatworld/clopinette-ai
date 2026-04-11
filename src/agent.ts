@@ -34,6 +34,13 @@ import {
   MEMORY_CHAR_LIMIT,
   USER_CHAR_LIMIT,
 } from "./config/constants.js";
+import type { Plan } from "./inference/provider.js";
+
+/** Coerce the persisted plan string into the strict Plan union expected by provider.ts. */
+function coercePlan(value: string | null | undefined): Plan {
+  if (value === "trial" || value === "pro" || value === "byok") return value;
+  return undefined;
+}
 
 export class ClopinetteAgent extends AIChatAgent<Env, AgentState> {
   maxPersistedMessages = MAX_PERSISTED_MESSAGES;
@@ -444,6 +451,7 @@ export class ClopinetteAgent extends AIChatAgent<Env, AgentState> {
         platform: "websocket",
         userId: this.#userId,
         sessionId: this.#sessionId!,
+        plan: coercePlan(this.state.plan),
         sql: this.sql.bind(this),
         env: this.env,
         messages,
@@ -590,6 +598,7 @@ export class ClopinetteAgent extends AIChatAgent<Env, AgentState> {
         platform,
         userId: this.#userId,
         sessionId: this.#sessionId!,
+        plan: coercePlan(this.state.plan),
         sql: sqlBound,
         env: this.env,
         messages: [...messages, { role: "user" as const, content: userText }],
@@ -735,6 +744,27 @@ export class ClopinetteAgent extends AIChatAgent<Env, AgentState> {
       status: this.state.status,
       configuredKeys: rows.map((r) => r.key),
     };
+  }
+
+  /**
+   * RPC entry point used by `delegate-workflow.ts` to fetch the user's
+   * inference config without going through SQLite directly. The workflow runs
+   * in a separate isolate and doesn't share the agent's master key, so it
+   * cannot decrypt API keys on its own — only the DO can.
+   *
+   * Returns the decrypted InferenceConfig + the user's plan so the workflow
+   * can build the right model via `createModel` / `createAuxiliaryModel`.
+   * Throws PlanViolationError when BYOK is misconfigured (caller surfaces it).
+   */
+  @callable()
+  async getInferenceConfigForDelegation(): Promise<{
+    config: import("./config/types.js").InferenceConfig;
+    plan: Plan;
+  }> {
+    const { loadInferenceConfig } = await import("./inference/provider.js");
+    const plan = coercePlan(this.state.plan);
+    const config = await loadInferenceConfig(this.sql.bind(this), this.env.MASTER_KEY, plan);
+    return { config, plan };
   }
 
   // ───────────────────────── Admin (callable from Worker) ─────────────────────────
@@ -1159,7 +1189,13 @@ export class ClopinetteAgent extends AIChatAgent<Env, AgentState> {
     const safeId = this.#userId.replace(/[^a-zA-Z0-9_-]/g, "");
     if (safeId) {
       try {
-        for (const prefix of [`${safeId}/docs/`, `${safeId}/audio/`, `${safeId}/images/`, `${safeId}/skills/`]) {
+        for (const prefix of [
+          `${safeId}/docs/`,
+          `${safeId}/audio/`,
+          `${safeId}/images/`,
+          `${safeId}/skills/`,
+          `${safeId}/spillover/`,
+        ]) {
           const listed = await this.env.MEMORIES.list({ prefix, limit: 1000 });
           if (listed.objects.length > 0) {
             await this.env.MEMORIES.delete(listed.objects.map((o) => o.key));
@@ -1525,15 +1561,30 @@ export class ClopinetteAgent extends AIChatAgent<Env, AgentState> {
         case "selfLearning": {
           const { runSelfLearningReview } = await import("./memory/self-learning.js");
           const { trackAuxiliaryUsage } = await import("./pipeline.js");
-          const { AUXILIARY_MODEL } = await import("./config/constants.js");
+          const { loadInferenceConfig, createAuxiliaryModel, PlanViolationError } = await import("./inference/provider.js");
+          const sqlBound = this.sql.bind(this);
+          // Build the same auxiliary model the live pipeline would use, so BYOK
+          // background reviews charge the user's BYOK provider — never our Workers AI.
+          let auxiliary: { model: import("ai").LanguageModel; modelId: string };
+          try {
+            const plan = coercePlan(this.state.plan);
+            const config = await loadInferenceConfig(sqlBound, this.env.MASTER_KEY, plan);
+            auxiliary = createAuxiliaryModel(config, this.env, plan);
+          } catch (err) {
+            if (err instanceof PlanViolationError) {
+              console.warn(`[selfLearning] skipped — ${err.message}`);
+              break;
+            }
+            throw err;
+          }
           const r = await runSelfLearningReview(
-            task.summary, this.sql.bind(this), this.env.AI,
+            task.summary, sqlBound, auxiliary.model,
             this.env.MEMORIES, this.env.SKILLS, task.userId, task.options
           );
           if (r.tokensIn > 0 || r.tokensOut > 0) {
             trackAuxiliaryUsage(
-              this.sql.bind(this), task.sessionId, r.tokensIn, r.tokensOut,
-              AUXILIARY_MODEL, this.env, task.userId,
+              sqlBound, task.sessionId, r.tokensIn, r.tokensOut,
+              auxiliary.modelId, this.env, task.userId,
             );
           }
           if (r.memoryActions > 0 || r.skillActions > 0) {

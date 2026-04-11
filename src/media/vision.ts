@@ -2,7 +2,7 @@ import type { MediaAsset } from "../config/types.js";
 
 /**
  * Vision module — convert images to base64 data URIs for LLM vision.
- * Works with Kimi K2.5, Llama 3.2 Vision, Llama 4 Scout, Mistral Small 3.1.
+ * Works with any vision-capable LLM (Llama 3.2 Vision, Llama 4 Scout, Mistral Small 3.1, Claude, GPT-4o, etc.).
  */
 
 /**
@@ -23,7 +23,6 @@ export async function prepareImageForVision(
 
   // Pass raw base64 (not data: URI). The AI SDK handles the conversion:
   // base64 string -> Uint8Array -> workers-ai-provider -> data: URI for Workers AI.
-  // This works with all vision models (Kimi K2.5, Llama, Mistral, etc.)
   return { ...asset, dataUri: base64 };
 }
 

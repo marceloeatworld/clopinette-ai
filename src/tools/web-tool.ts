@@ -1,7 +1,6 @@
 import { z } from "zod";
 import { generateText } from "ai";
-import { createWorkersAI } from "workers-ai-provider";
-import { DEFAULT_MODEL } from "../config/constants.js";
+import type { LanguageModel } from "ai";
 
 /**
  * Unified web tool — 100% Cloudflare-native.
@@ -225,7 +224,7 @@ async function searchViaScrape(
 export function createWebTool(
   accountId: string,
   browserToken: string | undefined,
-  ai?: Ai,
+  auxModel?: LanguageModel,
   searxngUrl?: string,
   braveApiKey?: string,
 ) {
@@ -254,17 +253,17 @@ export function createWebTool(
         .describe("Action to perform"),
       query: z.string().optional().describe("Search query (for 'search')"),
       url: z.string().optional().describe("URL (for read/extract/scrape/links/crawl_start)"),
-      count: z.number().optional().default(5).describe("Number of search results (default 5, max 10)"),
+      count: z.coerce.number().optional().default(5).describe("Number of search results (default 5, max 10)"),
       engine: z.string().optional()
         .describe("Ignored — search uses automatic fallback chain (SearXNG → Brave API → Browser Rendering)."),
       prompt: z.string().optional().describe("For 'extract': what data to extract"),
       schema: z.string().optional().describe("For 'extract': JSON schema string for structured output"),
       selector: z.string().optional().describe("For 'scrape': CSS selector (e.g. 'article', '.content', 'table')"),
       waitForSelector: z.string().optional().describe("CSS selector to wait for before capturing (SPAs)"),
-      cacheTTL: z.number().optional().describe("Cache TTL in seconds (default 0, use 300 for stable pages)"),
+      cacheTTL: z.coerce.number().optional().describe("Cache TTL in seconds (default 0, use 300 for stable pages)"),
       jobId: z.string().optional().describe("For 'crawl_check': job ID from crawl_start"),
-      maxPages: z.number().optional().default(10).describe("For 'crawl_start': max pages (default 10, max 100)"),
-      staticOnly: z.boolean().optional().describe("For 'crawl_start': skip browser rendering (faster for static HTML)"),
+      maxPages: z.coerce.number().optional().default(10).describe("For 'crawl_start': max pages (default 10, max 100)"),
+      staticOnly: z.coerce.boolean().optional().describe("For 'crawl_start': skip browser rendering (faster for static HTML)"),
       includePattern: z.string().optional().describe("For 'crawl_start': URL pattern to include (e.g. '/docs/**')"),
       excludePattern: z.string().optional().describe("For 'crawl_start': URL pattern to exclude"),
     }),
@@ -352,8 +351,8 @@ export function createWebTool(
           const data = await resp.json<{ success: boolean; result: string }>();
           const raw = data.result ?? "";
 
-          if (ai && raw.length > SUMMARIZE_THRESHOLD) {
-            const summary = await summarizeContent(ai, raw, params.url);
+          if (auxModel && raw.length > SUMMARIZE_THRESHOLD) {
+            const summary = await summarizeContent(auxModel, raw, params.url);
             if (summary) {
               return { ok: true, url: params.url, content: summary, originalLength: raw.length, summarized: true };
             }
@@ -472,11 +471,8 @@ export function createWebTool(
 
 // ─── LLM Content Summarization ────────────────────────────────────────────────
 
-async function summarizeContent(ai: Ai, content: string, url: string): Promise<string | null> {
+async function summarizeContent(model: LanguageModel, content: string, url: string): Promise<string | null> {
   try {
-    const workersai = createWorkersAI({ binding: ai });
-    const model = workersai(DEFAULT_MODEL);
-
     if (content.length > CHUNK_THRESHOLD) {
       return await summarizeChunked(model, content, url);
     }
@@ -492,7 +488,7 @@ async function summarizeContent(ai: Ai, content: string, url: string): Promise<s
 }
 
 async function summarizeChunked(
-  model: ReturnType<ReturnType<typeof createWorkersAI>>,
+  model: LanguageModel,
   content: string, url: string,
 ): Promise<string | null> {
   const chunks: string[] = [];

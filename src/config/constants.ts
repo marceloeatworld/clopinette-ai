@@ -2,10 +2,18 @@ import type { Platform } from "./types.js";
 
 export const KIMI_MODEL = "@cf/moonshotai/kimi-k2.5";
 export const GEMMA_MODEL = "@cf/google/gemma-4-26b-a4b-it";
-export const DEFAULT_MODEL = KIMI_MODEL;
+
+/**
+ * DEFAULT_MODEL is used for **internal/auxiliary** work: compression, self-learning,
+ * delegate sub-agents, page summarization, browser AI snapshots. We keep this on Gemma
+ * because it's smaller, cheaper and fast enough for auxiliary tasks. The user-facing
+ * conversation model is whatever they pick via /model — Kimi or Gemma on free plans,
+ * any BYOK provider on Pro/BYOK.
+ */
+export const DEFAULT_MODEL = GEMMA_MODEL;
 export const AUXILIARY_MODEL = GEMMA_MODEL;
 
-/** Workers AI models available to trial + pro plans (BYOK plan has none). */
+/** Workers AI models available to trial + pro plans as user-facing chat models. */
 export const WORKERS_AI_MODELS = [KIMI_MODEL, GEMMA_MODEL] as const;
 export type WorkersAiModel = typeof WORKERS_AI_MODELS[number];
 export function isWorkersAiModel(model: string): model is WorkersAiModel {

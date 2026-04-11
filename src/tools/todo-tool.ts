@@ -25,7 +25,7 @@ export function createTodoTool(ctx: ToolContext) {
     inputSchema: z.object({
       action: z.enum(["list", "add", "done", "remove"]).describe("Action to perform"),
       text: z.string().optional().describe("Todo text (for add)"),
-      id: z.number().optional().describe("Todo ID (for done/remove)"),
+      id: z.coerce.number().optional().describe("Todo ID (for done/remove)"),
     }),
     execute: async (params: { action: string; text?: string; id?: number }) => {
       switch (params.action) {

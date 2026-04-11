@@ -1,13 +1,16 @@
 import { WorkflowEntrypoint, type WorkflowEvent, type WorkflowStep } from "cloudflare:workers";
 import { generateText, stepCountIs } from "ai";
-import { createWorkersAI } from "workers-ai-provider";
 import { createWebTool } from "./tools/web-tool.js";
 import { createBrowserTool } from "./tools/browser-tool.js";
 import {
-  DEFAULT_MODEL,
   DELEGATE_MAX_DEPTH,
   DELEGATE_MAX_STEPS,
 } from "./config/constants.js";
+import {
+  createModel,
+  createAuxiliaryModel,
+  PlanViolationError,
+} from "./inference/provider.js";
 import type { ToolContext } from "./tools/registry.js";
 
 /**
@@ -76,7 +79,7 @@ export class DelegateWorkflow extends WorkflowEntrypoint<Env, DelegateWorkflowPa
         retries: { limit: 3, delay: "5 seconds", backoff: "exponential" },
         timeout: "5 minutes",
       },
-      async () => this.#runInference(goal, context),
+      async () => this.#runInference(goal, context, userId),
     );
 
     // Step 2: notify the parent DO via RPC — separate step so a failed notify retries
@@ -86,19 +89,44 @@ export class DelegateWorkflow extends WorkflowEntrypoint<Env, DelegateWorkflowPa
     return outcome;
   }
 
-  async #runInference(goal: string, context?: string): Promise<InferenceOutcome> {
+  async #runInference(goal: string, context: string | undefined, userId: string): Promise<InferenceOutcome> {
     const start = Date.now();
     const toolTrace: string[] = [];
 
     try {
-      const model = createWorkersAI({ binding: this.env.AI })(DEFAULT_MODEL);
+      // Fetch the parent user's inference config + plan via RPC. The DO holds
+      // the master key — only it can decrypt API keys. This keeps BYOK delegates
+      // routed through the user's own provider instead of our Workers AI.
+      const stub = this.env.CLOPINETTE_AGENT.get(this.env.CLOPINETTE_AGENT.idFromName(userId));
+      let model;
+      let auxiliary;
+      try {
+        const { config, plan } = await stub.getInferenceConfigForDelegation();
+        model = createModel(config, this.env, undefined, { plan });
+        auxiliary = createAuxiliaryModel(config, this.env, plan);
+      } catch (err) {
+        if (err instanceof PlanViolationError) {
+          return {
+            status: "error",
+            summary: `Delegation skipped — ${err.message}`,
+            toolTrace,
+            tokensIn: 0,
+            tokensOut: 0,
+            durationSeconds: Math.round((Date.now() - start) / 1000),
+          };
+        }
+        throw err;
+      }
 
-      // Stateless tool context — no SQLite, no R2 writes, no memory
+      // Stateless tool context — no SQLite, no R2 writes, no memory.
+      // auxModel is the BYOK-aware model used by web summarization + browser snapshots.
       const minimalCtx: ToolContext = {
         sql: (() => []) as unknown as ToolContext["sql"],
         r2Memories: null as unknown as R2Bucket,
         r2Skills: null as unknown as R2Bucket,
         ai: this.env.AI,
+        auxModel: auxiliary.model,
+        auxModelId: auxiliary.modelId,
         userId: "delegate",
         sessionId: "delegate",
         env: { WS_SIGNING_SECRET: this.env.WS_SIGNING_SECRET },
@@ -113,7 +141,7 @@ export class DelegateWorkflow extends WorkflowEntrypoint<Env, DelegateWorkflowPa
         web: createWebTool(
           minimalCtx.cfAccountId,
           minimalCtx.cfBrowserToken,
-          minimalCtx.ai,
+          minimalCtx.auxModel,
           minimalCtx.searxngUrl,
           minimalCtx.braveApiKey,
         ),

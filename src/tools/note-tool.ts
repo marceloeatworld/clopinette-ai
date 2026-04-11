@@ -23,7 +23,7 @@ export function createNoteTool(ctx: ToolContext) {
     inputSchema: z.object({
       action: z.enum(["save", "list", "delete", "edit", "search"]).describe("Action to perform"),
       content: z.string().optional().describe("Note content (for save/edit) or search query (for search)"),
-      id: z.number().optional().describe("Note id (for delete/edit)"),
+      id: z.coerce.number().optional().describe("Note id (for delete/edit)"),
     }),
     execute: async (params: { action: string; content?: string; id?: number }) => {
       switch (params.action) {

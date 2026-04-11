@@ -1,6 +1,7 @@
 import { SQL_MAX_CONTENT_LENGTH } from "../config/constants.js";
 import type { SessionMessageRow } from "../config/types.js";
 import { upsertMessageVector, searchSessionsHybrid } from "./vector-search.js";
+import { redact } from "../enterprise/redact.js";
 
 import type { SqlFn } from "../config/sql.js";
 
@@ -29,11 +30,16 @@ export function mirrorMessage(
   toolName?: string,
   vectorCtx?: MirrorVectorCtx,
 ): void {
+  // Secret-redact before anything else — if a tool result or an LLM response
+  // contains an API key (whether by accident or by injection), we scrub it
+  // before it ever touches SQLite, FTS5, or Vectorize.
+  const scrubbed = redact(content);
+
   // Truncate to stay under 100KB SQL statement limit
   const truncated =
-    content.length > SQL_MAX_CONTENT_LENGTH
-      ? content.slice(0, SQL_MAX_CONTENT_LENGTH) + "\n[truncated]"
-      : content;
+    scrubbed.length > SQL_MAX_CONTENT_LENGTH
+      ? scrubbed.slice(0, SQL_MAX_CONTENT_LENGTH) + "\n[truncated]"
+      : scrubbed;
 
   sql`INSERT INTO session_messages (session_id, role, content, tool_call_id, tool_name)
       VALUES (${sessionId}, ${role}, ${truncated}, ${toolCallId ?? null}, ${toolName ?? null})`;

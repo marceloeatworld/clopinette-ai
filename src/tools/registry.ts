@@ -1,6 +1,7 @@
 import { z } from "zod";
 import { createCodeTool } from "@cloudflare/codemode/ai";
 import { DynamicWorkerExecutor } from "@cloudflare/codemode";
+import type { LanguageModel } from "ai";
 import type { SqlFn } from "../config/sql.js";
 import { createMemoryTool } from "./memory-tool.js";
 import { createSessionSearchTool } from "./session-search-tool.js";
@@ -19,12 +20,21 @@ import { trackAuxiliaryUsage, type BackgroundTask } from "../pipeline.js";
 
 /**
  * Tool context passed from the agent to each tool factory.
+ *
+ * `auxModel` / `auxModelId` are pre-built by the pipeline via `createAuxiliaryModel`
+ * and routed to tools that need an LLM (web summarization, browser snapshots,
+ * tts, image generation). This is the only way for these features to remain
+ * BYOK-correct — they never touch `ai` (the raw Workers AI binding) directly.
  */
 export interface ToolContext {
   sql: SqlFn;
   r2Memories: R2Bucket;
   r2Skills: R2Bucket;
   ai: Ai;
+  /** Pre-built auxiliary LLM (BYOK-aware). Optional for callers (e.g. delegates) that build their own. */
+  auxModel?: LanguageModel;
+  /** Model id used for usage tracking when `auxModel` runs. */
+  auxModelId?: string;
   userId: string;
   sessionId: string;
   env: { GATEWAY_URL?: string; GATEWAY_INTERNAL_KEY?: string; WS_SIGNING_SECRET: string };
@@ -59,7 +69,7 @@ export function buildTools(ctx: ToolContext) {
   const historyTool = createSessionSearchTool(ctx);
   const docsTool = createDocsTool(ctx);
   const notesTool = createNoteTool(ctx);
-  const webTool = createWebTool(ctx.cfAccountId, ctx.cfBrowserToken, ctx.ai, ctx.searxngUrl, ctx.braveApiKey);
+  const webTool = createWebTool(ctx.cfAccountId, ctx.cfBrowserToken, ctx.auxModel, ctx.searxngUrl, ctx.braveApiKey);
   const ttsTool = createTtsTool(ctx.ai, ctx.r2Memories, ctx.userId, createUsageTracker(ctx));
   const imageTool = createImageGenTool(ctx.ai, ctx.r2Memories, ctx.userId, createUsageTracker(ctx));
 

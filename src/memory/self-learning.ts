@@ -1,6 +1,6 @@
 import { generateText } from "ai";
-import { createWorkersAI } from "workers-ai-provider";
-import { DEFAULT_MODEL, MEMORY_CHAR_LIMIT, USER_CHAR_LIMIT } from "../config/constants.js";
+import type { LanguageModel } from "ai";
+import { MEMORY_CHAR_LIMIT, USER_CHAR_LIMIT } from "../config/constants.js";
 import { getPromptMemory, updatePromptMemory } from "./prompt-memory.js";
 import { createSkill, searchSkills, editSkill } from "./skills.js";
 import { logAudit } from "../enterprise/audit.js";
@@ -179,11 +179,14 @@ interface ReviewResult {
 /**
  * Run a background self-learning review.
  * Called after every REVIEW_INTERVAL turns.
+ *
+ * The caller provides a pre-built `model` (from createAuxiliaryModel) so that
+ * BYOK users review against their own provider, never against Workers AI.
  */
 export async function runSelfLearningReview(
   conversationSummary: string,
   sql: SqlFn,
-  ai: Ai,
+  model: LanguageModel,
   r2Memories: R2Bucket,
   r2Skills: R2Bucket,
   userId: string,
@@ -205,9 +208,8 @@ export async function runSelfLearningReview(
   }
 
   try {
-    const workersai = createWorkersAI({ binding: ai });
     const response = await generateText({
-      model: workersai(DEFAULT_MODEL),
+      model,
       system: "You are a self-learning review agent. Analyze the conversation and output JSON only.",
       prompt: `Conversation to review:\n\n${conversationSummary}\n\n---\n\n${prompt}`,
       maxRetries: 1,

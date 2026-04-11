@@ -90,13 +90,14 @@ Work on every platform (web, Telegram, WhatsApp, Discord).
 
 | Setting | Value |
 |---|---|
-| Default model | Kimi K2.5 via Workers AI |
-| Auxiliary model | Gemma 4 26B A4B IT — smart routing, compression, self-learning |
+| Workers AI tier | Kimi K2.5 + Gemma 4 26B (free for trial / pro) |
+| Internal / auxiliary | Gemma 4 26B — compression, self-learning, web summarization, browser snapshots |
 | BYOK | 12 providers via AI Gateway, per-provider config, cross-provider auxiliary |
+| BYOK enforcement | BYOK plan never touches Workers AI for inference — all chat, compression, self-learning, delegates run on the user's own provider |
 | Max steps | 6 parent, 3 delegate |
 | Context compression | Structured summary at 40+ messages |
 | Prefix caching | Workers AI session affinity + cached system prompt (~83% token savings) |
-| Error recovery | 429/529 → immediate fallback to Workers AI default |
+| Error recovery | 429/529 → fallback to Workers AI default for trial / pro. BYOK surfaces the original provider error (no silent Workers AI fallback). |
 
 ## Installation
 

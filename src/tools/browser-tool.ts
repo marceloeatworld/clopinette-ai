@@ -1,7 +1,6 @@
 import { z } from "zod";
 import { generateText } from "ai";
-import { createWorkersAI } from "workers-ai-provider";
-import { AUXILIARY_MODEL } from "../config/constants.js";
+import type { LanguageModel } from "ai";
 import type { ToolContext } from "./registry.js";
 
 /**
@@ -51,11 +50,11 @@ export function createBrowserTool(ctx: ToolContext) {
       ref: z.string().optional().describe("Element ref number from snapshot (for click/type/select)"),
       element: z.string().optional().describe("Description of the element (for click/type/select)"),
       text: z.string().optional().describe("Text to type (for 'type') or to wait for (for 'wait')"),
-      submit: z.boolean().optional().describe("Press Enter after typing (for 'type')"),
+      submit: z.coerce.boolean().optional().describe("Press Enter after typing (for 'type')"),
       key: z.string().optional().describe("Key to press (for 'press_key', e.g. 'Enter', 'Tab')"),
       values: z.string().optional().describe("JSON array of values (for 'select')"),
-      time: z.number().optional().describe("Seconds to wait (for 'wait')"),
-      accept: z.boolean().optional().describe("Accept or dismiss dialog (for 'handle_dialog')"),
+      time: z.coerce.number().optional().describe("Seconds to wait (for 'wait')"),
+      accept: z.coerce.boolean().optional().describe("Accept or dismiss dialog (for 'handle_dialog')"),
       promptText: z.string().optional().describe("Text for prompt dialog (for 'handle_dialog')"),
     }),
     execute: async (params: {
@@ -162,12 +161,12 @@ async function callMcpTool(
       request.id = session.msgId;
       const retry = await fetchMcp(stub, session, request);
       if (retry.error) return { ok: false, error: retry.error.message };
-      return parseToolResult(retry.result, ctx.ai);
+      return parseToolResult(retry.result, ctx.auxModel);
     }
     return { ok: false, error: resp.error.message };
   }
 
-  return parseToolResult(resp.result, ctx.ai);
+  return parseToolResult(resp.result, ctx.auxModel);
 }
 
 async function initMcpSession(
@@ -280,7 +279,7 @@ async function parseResponse(resp: Response): Promise<McpResponse> {
 
 async function parseToolResult(
   result: unknown,
-  ai?: Ai,
+  auxModel?: LanguageModel,
 ): Promise<{ ok: boolean; content?: string; error?: string }> {
   if (!result || typeof result !== "object") {
     return { ok: true, content: "(no content)" };
@@ -304,13 +303,13 @@ async function parseToolResult(
 
   let content = parts.join("\n");
 
-  // LLM summarize large snapshots (like Hermes browser_snapshot summarization)
-  if (ai && content.length > SNAPSHOT_SUMMARIZE_THRESHOLD) {
+  // LLM summarize large snapshots (like Hermes browser_snapshot summarization).
+  // Uses the pre-built auxiliary model from the pipeline (BYOK-aware — never
+  // touches Workers AI for BYOK users).
+  if (auxModel && content.length > SNAPSHOT_SUMMARIZE_THRESHOLD) {
     try {
-      const workersai = createWorkersAI({ binding: ai });
-      const model = workersai(AUXILIARY_MODEL);
       const { text } = await generateText({
-        model,
+        model: auxModel,
         system:
           "You are summarizing a browser accessibility snapshot. Extract the key page structure, " +
           "interactive elements (buttons, links, inputs with their ref IDs like @e5), and visible text content. " +

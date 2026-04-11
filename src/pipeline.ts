@@ -12,17 +12,27 @@ import { transcribeAudio } from "./media/transcribe.js";
 import { ingestSummary } from "./media/ingest.js";
 import { saveTranscript, updateContext, savePdfTranscript } from "./media/handler.js";
 import {
-  MAX_STEPS, DEFAULT_AGENT_IDENTITY, AUXILIARY_MODEL,
+  MAX_STEPS, DEFAULT_AGENT_IDENTITY,
   WHISPER_TOKENS_PER_KB,
 } from "./config/constants.js";
 import { buildSystemPrompt } from "./prompt-builder.js";
 import { getHonchoContext } from "./memory/honcho.js";
 import { mirrorMessage, type MirrorVectorCtx } from "./memory/session-search.js";
+import type { LanguageModel } from "ai";
 import { compressContext } from "./compression.js";
 import { resolveTools, buildTools } from "./tools/registry.js";
-import { createModel, loadInferenceConfig, loadFallbackConfig } from "./inference/provider.js";
+import {
+  createModel,
+  createAuxiliaryModel,
+  loadInferenceConfig,
+  loadFallbackConfig,
+  PlanViolationError,
+  type Plan,
+} from "./inference/provider.js";
 import { isAnthropicProvider, applyCacheControl } from "./inference/prompt-caching.js";
 import { routeModel } from "./inference/router.js";
+import { classifyError } from "./inference/error-classifier.js";
+import { redact } from "./enterprise/redact.js";
 import { checkBudget } from "./enterprise/budget.js";
 import { logAudit } from "./enterprise/audit.js";
 import {
@@ -43,6 +53,8 @@ export interface PipelineContext {
   platform: Platform;
   userId: string;
   sessionId: string;
+  /** User's billing plan — drives BYOK enforcement (no Workers AI fallback for BYOK). */
+  plan?: Plan;
 
   // Dependencies
   sql: SqlFn;
@@ -224,23 +236,93 @@ function incrementTurn(sql: SqlFn): number {
 
 type ToolLike = { description: string; inputSchema: unknown; execute: (args: unknown) => Promise<unknown> };
 
+/** Per-result spillover threshold: results larger than this land in R2. */
+const SPILL_THRESHOLD_BYTES = 20_000;
+/** Preview length for spilled results — enough for the LLM to decide whether to read the full file. */
+const SPILL_PREVIEW_CHARS = 800;
+
+export interface SpillContext {
+  r2: R2Bucket;
+  userId: string;
+  sessionId: string;
+}
+
+function sanitizeForPath(id: string): string {
+  return id.replace(/[^a-zA-Z0-9_-]/g, "");
+}
+
 /**
- * Enhance tools with three Hermes-inspired upgrades:
+ * If the tool result is too large to safely return inline, persist it to R2
+ * under `${userId}/spillover/${sessionId}/...` and return a preview + r2Key
+ * that the LLM can re-open via `docs({ action: "read_spillover", r2Key })`.
+ *
+ * This prevents silent context overflow on large crawls, greps, and search
+ * results while keeping the full data accessible on demand.
+ */
+async function maybeSpillResult(
+  name: string,
+  result: unknown,
+  spill: SpillContext,
+): Promise<unknown> {
+  if (result === null || result === undefined) return result;
+  let serialized: string;
+  try {
+    serialized = typeof result === "string" ? result : JSON.stringify(result);
+  } catch {
+    return result;
+  }
+  if (serialized.length <= SPILL_THRESHOLD_BYTES) return result;
+
+  const safeUserId = sanitizeForPath(spill.userId);
+  const safeSessionId = sanitizeForPath(spill.sessionId);
+  const safeName = sanitizeForPath(name);
+  const r2Key = `${safeUserId}/spillover/${safeSessionId}/${Date.now()}-${safeName}.json`;
+
+  try {
+    await spill.r2.put(r2Key, serialized, {
+      httpMetadata: { contentType: "application/json" },
+      customMetadata: { tool: name, sessionId: spill.sessionId, spilledAt: String(Date.now()) },
+    });
+  } catch (err) {
+    // R2 write failed — return a truncated version so the turn can continue
+    console.warn(`[spill] r2 put failed for ${name}:`, err instanceof Error ? err.message : String(err));
+    return {
+      _truncated: true,
+      _tool: name,
+      _originalBytes: serialized.length,
+      preview: serialized.slice(0, SPILL_PREVIEW_CHARS),
+    };
+  }
+
+  return {
+    _spilled: true,
+    _tool: name,
+    r2Key,
+    preview: serialized.slice(0, SPILL_PREVIEW_CHARS),
+    fullSizeBytes: serialized.length,
+    instruction: `Full tool result (${serialized.length} bytes) saved to R2. If the preview is insufficient, call docs({ action: "read_spillover", r2Key: "${r2Key}" }) to retrieve it.`,
+  };
+}
+
+/**
+ * Enhance tools with four Hermes-inspired upgrades:
  * 1. Budget pressure: inject _budget warnings at 70%/90% of MAX_STEPS
  * 2. Dedup: skip duplicate tool calls (same name+args within 2s window)
  * 3. Fuzzy matching: Proxy-based correction for hallucinated tool names
+ * 4. Oversized result spillover to R2 (prevents silent context overflow)
  */
 function enhanceTools(
   tools: Record<string, unknown>,
   maxSteps: number,
   getStep: () => number,
   onToolProgress?: (toolName: string, preview: string) => void,
+  spillCtx?: SpillContext,
 ): Record<string, unknown> {
   // Dedup cache: key → { result, timestamp }
   const dedupCache = new Map<string, { result: unknown; ts: number }>();
   const DEDUP_TTL = 2000; // 2 seconds
 
-  // Wrap each tool with budget pressure + dedup
+  // Wrap each tool with budget pressure + dedup + spillover
   const enhanced = Object.fromEntries(
     Object.entries(tools).map(([name, tool]) => {
       const t = tool as ToolLike;
@@ -261,7 +343,12 @@ function enhanceTools(
             onToolProgress(name, String(preview).slice(0, 80));
           }
 
-          const result = await t.execute(args);
+          let result = await t.execute(args);
+
+          // Spill oversized results to R2 before caching / returning
+          if (spillCtx) {
+            result = await maybeSpillResult(name, result, spillCtx);
+          }
 
           // Cache for dedup
           dedupCache.set(dedupKey, { result, ts: Date.now() });
@@ -366,35 +453,65 @@ export async function runPipeline(
 ): Promise<PipelineResult | { error: string; status: number }> {
   ctx.onStateChange?.("thinking");
 
-  // Step 1: Load inference config (cached per session — no SQL query per turn)
+  // Step 1: Load inference config (cached per session — no SQL query per turn).
+  // Plan-aware: BYOK users that haven't configured a real provider get a clean
+  // PlanViolationError here, before any token is spent.
   let config: InferenceConfig;
-  if (ctx.cachedInferenceConfig) {
-    config = ctx.cachedInferenceConfig;
-  } else {
-    config = await loadInferenceConfig(ctx.sql, ctx.env.MASTER_KEY);
-    ctx.onCacheInferenceConfig?.(config);
+  let auxiliary: { model: LanguageModel; modelId: string };
+  let model: LanguageModel;
+  try {
+    if (ctx.cachedInferenceConfig) {
+      config = ctx.cachedInferenceConfig;
+    } else {
+      config = await loadInferenceConfig(ctx.sql, ctx.env.MASTER_KEY, ctx.plan);
+      ctx.onCacheInferenceConfig?.(config);
+    }
+
+    // Step 2: Smart model routing (runs BEFORE budget check for fast path)
+    const routing = routeModel(
+      ctx.userText,
+      config.model,
+      config.auxiliaryModel,
+      ctx.recentToolUse ?? 0,
+    );
+
+    // Step 3: Build the auxiliary model ONCE — used by compression, self-learning,
+    // web summarization, browser snapshots, and the simple-routing fast path.
+    // For BYOK this routes to the user's BYOK provider; for trial/pro it lands on Gemma.
+    auxiliary = createAuxiliaryModel(config, ctx.env, ctx.plan);
+
+    // Step 4: Create the primary model with session affinity.
+    // For the simple/auxiliary branch we reuse the pre-built auxiliary model
+    // (which already has the right credentials).
+    if (routing.reason === "simple") {
+      model = auxiliary.model;
+    } else {
+      model = createModel(config, ctx.env, routing.model, {
+        sessionAffinity: ctx.userId,
+        plan: ctx.plan,
+      });
+    }
+
+    // Hand-off to the rest of the pipeline via a closure variable. We collected
+    // routing here so the fast path below can read it.
+    return await runPipelineInner(ctx, mode, config, model, auxiliary, routing);
+  } catch (err) {
+    if (err instanceof PlanViolationError) {
+      ctx.onStateChange?.("idle");
+      return { error: err.message, status: 402 };
+    }
+    throw err;
   }
+}
 
-  // Step 2: Smart model routing (runs BEFORE budget check for fast path)
-  const routing = routeModel(
-    ctx.userText,
-    config.model,
-    config.auxiliaryModel,
-    ctx.recentToolUse ?? 0
-  );
-
-  // Step 3: Create model with session affinity.
-  // For the simple/auxiliary branch, swap in the auxiliary provider's credentials
-  // (cross-provider: primary=openai + auxiliary=anthropic, etc.).
-  const useAuxCreds = routing.reason === "simple"
-    && config.auxiliaryProvider !== undefined
-    && config.auxiliaryProvider !== config.provider;
-  const effectiveConfig = useAuxCreds
-    ? { ...config, apiKey: config.auxiliaryApiKey, provider: config.auxiliaryProvider }
-    : config;
-  const model = createModel(effectiveConfig, ctx.env, routing.model, {
-    sessionAffinity: ctx.userId,
-  });
+async function runPipelineInner(
+  ctx: PipelineContext,
+  mode: "stream" | "generate",
+  config: InferenceConfig,
+  model: LanguageModel,
+  auxiliary: { model: LanguageModel; modelId: string },
+  routing: ReturnType<typeof routeModel>,
+): Promise<PipelineResult | { error: string; status: number }> {
 
   // Fast path: simple messages skip history, tools, honcho, compression
   // Still checks budget to prevent billing bypass via greetings
@@ -435,7 +552,7 @@ export async function runPipeline(
         messages: fastMessages,
         onFinish: async ({ text, usage }) => {
           const fastConfig = { ...config, model: routing.model };
-          afterInference(ctx, fastConfig, text, usage);
+          afterInference(ctx, fastConfig, text, usage, auxiliary);
           ctx.onComplete?.({
             text,
             usage: usage ? {
@@ -459,7 +576,7 @@ export async function runPipeline(
     const text = result.text || "(no response)";
     // Use routing.model (AUXILIARY) not config.model (primary) for correct usage attribution
     const fastConfig = { ...config, model: routing.model };
-    afterInference(ctx, fastConfig, text, result.usage);
+    afterInference(ctx, fastConfig, text, result.usage, auxiliary);
     const fastUsage = result.usage ? { inputTokens: result.usage.inputTokens ?? 0, outputTokens: result.usage.outputTokens ?? 0, model: routing.model, sessionId: ctx.sessionId } : undefined;
     ctx.onComplete?.({ text, usage: fastUsage });
     ctx.onStateChange?.("idle");
@@ -513,17 +630,18 @@ export async function runPipeline(
     ctx.onCacheSystemPrompt?.(systemPrompt);
   }
 
-  // Step 7: Context compression (optional)
+  // Step 7: Context compression (optional). Uses the pre-built auxiliary model so
+  // BYOK users compress against their own provider, never against our Workers AI.
   let messages = ctx.messages;
   let didCompress = false;
   if (ctx.enableCompression !== false && messages.length > 40) {
-    const compression = await compressContext(messages, ctx.env.AI, ctx.sql, ctx.env.MEMORIES, ctx.userId);
+    const compression = await compressContext(messages, auxiliary.model, ctx.sql, ctx.env.MEMORIES, ctx.userId);
     if (compression) {
       messages = compression.compressed;
       didCompress = true;
       trackAuxiliaryUsage(
         ctx.sql, ctx.sessionId, compression.auxTokensIn, compression.auxTokensOut,
-        AUXILIARY_MODEL, ctx.env, ctx.userId,
+        auxiliary.modelId, ctx.env, ctx.userId,
       );
     }
   }
@@ -538,6 +656,8 @@ export async function runPipeline(
     r2Memories: ctx.env.MEMORIES,
     r2Skills: ctx.env.SKILLS,
     ai: ctx.env.AI,
+    auxModel: auxiliary.model,
+    auxModelId: auxiliary.modelId,
     userId: ctx.userId,
     sessionId: ctx.sessionId,
     env: ctx.env,
@@ -743,7 +863,7 @@ export async function runPipeline(
 
   // Shared onFinish callback (step 10)
   const onFinish = (text: string, usage?: { inputTokens?: number; outputTokens?: number }) => {
-    afterInference(ctx, config, text, usage);
+    afterInference(ctx, config, text, usage, auxiliary);
 
     // Update image R2 context metadata with LLM's description
     if (imageAssets.length > 0 && text) {
@@ -774,7 +894,12 @@ export async function runPipeline(
   // the warning naturally when reading tool results.
   const stepLimit = MAX_STEPS;
   let stepCount = 0;
-  const budgetWrapped = wrapToolsWithBudget(tools, stepLimit, () => stepCount, ctx.onToolProgress);
+  const spillCtx: SpillContext = {
+    r2: ctx.env.MEMORIES,
+    userId: ctx.userId,
+    sessionId: ctx.sessionId,
+  };
+  const budgetWrapped = wrapToolsWithBudget(tools, stepLimit, () => stepCount, ctx.onToolProgress, spillCtx);
   const onStepFinish = () => { stepCount++; };
 
   // Step 9c: LLM call with error recovery
@@ -882,21 +1007,32 @@ export async function runPipeline(
     ctx.onComplete?.({ text, usage: pipelineUsage });
     return { mode: "generate", text, usage: pipelineUsage, mediaDelivery: mediaDelivery.length > 0 ? mediaDelivery : undefined, toolTrace };
   } catch (err) {
-    // Error recovery: detect error type and try fallback model
-    const errMsg = err instanceof Error ? err.message : String(err);
-    const is429 = errMsg.includes("429") || errMsg.includes("rate") || errMsg.includes("Too Many");
-    const is529 = errMsg.includes("529") || errMsg.includes("overloaded");
-    if (is429 || is529) {
-      console.warn(`Rate limited (${is429 ? "429" : "529"}): switching to fallback immediately`);
-    } else {
-      console.warn(`Primary model failed: ${errMsg}`);
+    // Error recovery via structured classification — all provider quirks centralized.
+    // errMsg is redacted before logging/returning so that upstream error strings
+    // containing a leaked API key never hit the logs or the user-facing response.
+    const errMsg = redact(err instanceof Error ? err.message : String(err));
+    const classification = classifyError(err);
+    console.warn(`[pipeline] ${classification.hint} (kind=${classification.kind}): ${errMsg}`);
+
+    // Transient failures (rate_limit, overloaded) benefit from a short decorrelated jitter
+    // before hitting the fallback — prevents thundering-herd retry spikes under load.
+    if (classification.kind === "rate_limit" || classification.kind === "overloaded") {
+      const delayMs = classification.retryAfterMs ?? jitteredDelay(1);
+      if (delayMs > 0) await new Promise((r) => setTimeout(r, Math.min(delayMs, 5000)));
     }
 
-    const fallback = await loadFallbackConfig(ctx.sql, ctx.env);
+    // Non-fallbackable errors (thinking_signature) return immediately so the next
+    // user turn can retry with a fresh cache state.
+    if (!classification.shouldFallback) {
+      ctx.onStateChange?.("idle");
+      return { error: `Model error (${classification.kind}): ${errMsg}`, status: 502 };
+    }
+
+    const fallback = await loadFallbackConfig(ctx.sql, ctx.env, ctx.plan);
     if (fallback) {
-      console.log(`Falling back to ${fallback.model}`);
+      console.log(`[pipeline] Falling back to ${fallback.model}`);
       try {
-        const fbModel = createModel(fallback, ctx.env, fallback.model);
+        const fbModel = createModel(fallback, ctx.env, fallback.model, { plan: ctx.plan });
         const fbResult = await generateText({
           model: fbModel,
           system: systemPrompt,
@@ -920,14 +1056,24 @@ export async function runPipeline(
         ctx.onComplete?.({ text, usage: pipelineUsage, mediaDelivery: fbMediaDelivery.length > 0 ? fbMediaDelivery : undefined });
         return { mode: "generate", text, usage: pipelineUsage, mediaDelivery: fbMediaDelivery.length > 0 ? fbMediaDelivery : undefined };
       } catch (fbErr) {
-        console.error("Fallback also failed:", fbErr instanceof Error ? fbErr.message : String(fbErr));
+        console.error("[pipeline] Fallback also failed:", redact(fbErr instanceof Error ? fbErr.message : String(fbErr)));
       }
     }
 
     ctx.onStateChange?.("idle");
-    return { error: `Model error: ${errMsg}`, status: 502 };
+    return { error: `Model error (${classification.kind}): ${errMsg}`, status: 502 };
   }
 
+}
+
+/**
+ * Decorrelated exponential jitter — spreads thundering-herd retries by a random
+ * factor so multiple concurrent sessions never retry on the same instant.
+ * Cap at `capMs` to keep worst-case user-visible latency bounded.
+ */
+function jitteredDelay(attempt: number, baseMs = 250, capMs = 5000): number {
+  const exponential = Math.min(capMs, baseMs * 2 ** attempt);
+  return Math.floor(Math.random() * exponential);
 }
 
 // ───────────────────────── Media delivery extraction ─────────────────────────
@@ -993,7 +1139,8 @@ function afterInference(
   ctx: PipelineContext,
   config: InferenceConfig,
   text: string,
-  usage?: { inputTokens?: number; outputTokens?: number }
+  usage: { inputTokens?: number; outputTokens?: number } | undefined,
+  auxiliary: { model: LanguageModel; modelId: string },
 ): void {
   // Mirror assistant response to FTS5 + Vectorize
   if (text) {
@@ -1066,11 +1213,11 @@ function afterInference(
         });
       } else {
         runSelfLearningReview(
-          summary, ctx.sql, ctx.env.AI, ctx.env.MEMORIES, ctx.env.SKILLS, ctx.userId,
+          summary, ctx.sql, auxiliary.model, ctx.env.MEMORIES, ctx.env.SKILLS, ctx.userId,
           { reviewMemory: true, reviewSkills: true }
         ).then((r) => {
           if (r.tokensIn > 0 || r.tokensOut > 0) {
-            trackAuxiliaryUsage(ctx.sql, ctx.sessionId, r.tokensIn, r.tokensOut, AUXILIARY_MODEL, ctx.env, ctx.userId);
+            trackAuxiliaryUsage(ctx.sql, ctx.sessionId, r.tokensIn, r.tokensOut, auxiliary.modelId, ctx.env, ctx.userId);
           }
           if (r.memoryActions > 0 || r.skillActions > 0) {
             console.log(`Self-learning: ${r.memoryActions} memory, ${r.skillActions} skill updates`);

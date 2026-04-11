@@ -31,14 +31,14 @@ export function createCalendarTool(ctx: ToolContext) {
       title: z.string().optional().describe("Event title (required for create)"),
       startAt: z.string().optional().describe("Start datetime in ISO 8601 (e.g. 2026-03-20T20:00:00). Required for create."),
       endAt: z.string().optional().describe("End datetime in ISO 8601"),
-      allDay: z.boolean().optional().describe("True for all-day events"),
+      allDay: z.coerce.boolean().optional().describe("True for all-day events"),
       location: z.string().optional().describe("Event location"),
       description: z.string().optional().describe("Event description or notes"),
-      reminderMinutes: z.number().optional().describe("Reminder N minutes before (e.g. 15, 30, 60). Null = no reminder."),
+      reminderMinutes: z.coerce.number().optional().describe("Reminder N minutes before (e.g. 15, 30, 60). Null = no reminder."),
       id: z.string().optional().describe("Event ID (required for update/delete)"),
       from: z.string().optional().describe("Start date filter for list (YYYY-MM-DD)"),
       to: z.string().optional().describe("End date filter for list (YYYY-MM-DD)"),
-      limit: z.number().optional().describe("Max events to return"),
+      limit: z.coerce.number().optional().describe("Max events to return"),
     }),
     execute: async (params: {
       action: string; title?: string; startAt?: string; endAt?: string;

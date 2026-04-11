@@ -66,16 +66,37 @@ export function createDocsTool(ctx: ToolContext) {
       "- 'search': finds documents by query (auto-routes: semantic AI search if available, keyword fallback).\n" +
       "- 'ask': get an AI-generated answer with source citations (requires AutoRAG).\n" +
       "- 'list': show all uploaded files.\n" +
+      "- 'read_spillover': read a previously spilled tool result by its r2Key (when a large result was offloaded to storage).\n" +
       "USE when user asks about their documents, PDFs, or uploaded files.",
     inputSchema: z.object({
-      action: z.enum(["search", "ask", "list"]).describe("Action to perform"),
+      action: z.enum(["search", "ask", "list", "read_spillover"]).describe("Action to perform"),
       query: z.string().optional().describe("Search query (for search/ask)"),
-      maxResults: z.number().optional().default(5).describe("Max results (default 5)"),
+      maxResults: z.coerce.number().optional().default(5).describe("Max results (default 5)"),
+      r2Key: z.string().optional().describe("R2 key of a spilled tool result (for read_spillover)"),
     }),
-    execute: async (params: { action: string; query?: string; maxResults?: number }) => {
+    execute: async (params: { action: string; query?: string; maxResults?: number; r2Key?: string }) => {
       const limit = params.maxResults ?? 5;
 
       switch (params.action) {
+        // ─── READ SPILLOVER ───────────────────────────────────────────────
+        // Retrieves a tool result that was previously offloaded to R2 because
+        // it was too large to include directly in the LLM context.
+        case "read_spillover": {
+          if (!params.r2Key) return { ok: false, error: "r2Key required for read_spillover" };
+          // Security: the r2Key must belong to this user's spillover namespace
+          const expectedPrefix = `${sanitizeUserId(ctx.userId)}/spillover/`;
+          if (!params.r2Key.startsWith(expectedPrefix)) {
+            return { ok: false, error: "r2Key does not belong to this user's spillover namespace" };
+          }
+          try {
+            const obj = await ctx.r2Memories.get(params.r2Key);
+            if (!obj) return { ok: false, error: "Spillover not found (may have been purged)" };
+            const text = await obj.text();
+            return { ok: true, r2Key: params.r2Key, content: text.slice(0, 50_000), truncated: text.length > 50_000 };
+          } catch (err) {
+            return { ok: false, error: `Read failed: ${err instanceof Error ? err.message : String(err)}` };
+          }
+        }
         // ─── LIST ─────────────────────────────────────────────────────────
         case "list": {
           const prefix = `${sanitizeUserId(ctx.userId)}/docs/`;

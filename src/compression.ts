@@ -1,7 +1,5 @@
 import { generateText } from "ai";
-import { createWorkersAI } from "workers-ai-provider";
-import type { ModelMessage } from "ai";
-import { DEFAULT_MODEL } from "./config/constants.js";
+import type { LanguageModel, ModelMessage } from "ai";
 import { FLUSH_SYSTEM_PROMPT } from "./memory/flush.js";
 import { flushToMemory } from "./memory/flush.js";
 
@@ -73,19 +71,16 @@ export function resetCompressionState(): void {
 
 export async function compressContext(
   messages: ModelMessage[],
-  ai: Ai,
+  model: LanguageModel,
   sql: SqlFn,
   r2: R2Bucket,
   userId: string,
-  threshold: number = 40
+  threshold: number = 40,
 ): Promise<CompressionResult | null> {
   if (messages.length <= threshold) return null;
 
   // Step 0: Pre-prune old tool results (free tokens, no LLM needed)
   // Like Hermes: replace old tool output > 200 chars with a short marker
-
-  const workersai = createWorkersAI({ binding: ai });
-  const model = workersai(DEFAULT_MODEL);
 
   // Split: keep first + last N, compress the middle
   const first = messages[0];

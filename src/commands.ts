@@ -1,7 +1,7 @@
 import type { SqlFn } from "./config/sql.js";
 import { searchSessions } from "./memory/session-search.js";
 import { PERSONALITIES, PERSONALITY_NAMES } from "./config/personalities.js";
-import { DEFAULT_SOUL_MD } from "./config/constants.js";
+import { DEFAULT_SOUL_MD, DEFAULT_MODEL, WORKERS_AI_MODELS, isWorkersAiModel } from "./config/constants.js";
 
 /**
  * Shared slash commands — work on ALL gateways (Telegram, WebSocket, Discord, Slack, API).
@@ -68,7 +68,7 @@ export async function handleCommand(
       // Prefer model:{provider}, fall back to legacy model, then default
       const model = (provider && configMap.get(`model:${provider}`))
         || configMap.get("model")
-        || "@cf/moonshotai/kimi-k2.5";
+        || DEFAULT_MODEL;
       const name = configMap.get("display_name") || "not set";
 
       const now = new Date();
@@ -106,6 +106,65 @@ export async function handleCommand(
         ].join("\n"),
         handled: true,
       };
+    }
+
+    case "/insights": {
+      // Per-model cost breakdown for the current calendar month.
+      // Assumes a 30/70 input/output split — a typical long-reply chat pattern.
+      // Users get a `Prices updated: ...` footer so stale estimates are obvious.
+      const { estimateCost, isKnownModel, PRICING_UPDATED_AT } = await import("./inference/pricing.js");
+
+      const now = new Date();
+      const monthStart = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-01`;
+
+      const perModel = ctx.sql<{ model: string | null; tokens: number; sessions: number }>`
+        SELECT model, COALESCE(SUM(total_tokens), 0) AS tokens, COUNT(*) AS sessions
+        FROM sessions
+        WHERE started_at >= ${monthStart}
+        GROUP BY model
+        HAVING tokens > 0
+        ORDER BY tokens DESC
+      `;
+
+      if (perModel.length === 0) {
+        return { text: "No recorded usage this month yet. Have a chat first.", handled: true };
+      }
+
+      const INPUT_RATIO = 0.3;
+      const OUTPUT_RATIO = 0.7;
+      let totalCost = 0;
+      let totalTokens = 0;
+      let hasUnknown = false;
+
+      const lines: string[] = [
+        "**Month usage by model**",
+        "",
+        "| Model | Sessions | Tokens | Est. cost |",
+        "| --- | ---:| ---:| ---:|",
+      ];
+
+      for (const row of perModel) {
+        const model = row.model ?? "(unknown)";
+        const inputTokens = Math.round(row.tokens * INPUT_RATIO);
+        const outputTokens = Math.round(row.tokens * OUTPUT_RATIO);
+        const cost = estimateCost(model, inputTokens, outputTokens);
+        totalCost += cost;
+        totalTokens += row.tokens;
+        const flag = isKnownModel(model) ? "" : " ⚠︎";
+        const label = model.length > 42 ? model.slice(0, 39) + "..." : model;
+        if (!isKnownModel(model)) hasUnknown = true;
+        lines.push(`| \`${label}\`${flag} | ${row.sessions} | ${(row.tokens / 1000).toFixed(1)}k | $${cost.toFixed(3)} |`);
+      }
+
+      lines.push("");
+      lines.push(`**Total:** ${(totalTokens / 1000).toFixed(1)}k tokens — **$${totalCost.toFixed(2)}** (estimated)`);
+      lines.push("");
+      lines.push(`_Assumes 30/70 input/output split. Prices updated: ${PRICING_UPDATED_AT}._`);
+      if (hasUnknown) {
+        lines.push(`_⚠︎ = model not in pricing table, default rate applied._`);
+      }
+
+      return { text: lines.join("\n"), handled: true };
     }
 
     case "/forget":
@@ -242,6 +301,133 @@ export async function handleCommand(
       return { text: "Usage: `/session idle <min>` | `/session daily <hour>` | `/session mode <mode>`", handled: true };
     }
 
+    case "/model": {
+      // Plan matrix (mirrors the gateway's validateConfigField):
+      //   trial → Workers AI only (Kimi K2.5, Gemma 4)
+      //   pro   → Workers AI + any BYOK provider the user has a key for
+      //   byok  → BYOK only (no Workers AI)
+      const plan = (await ctx.env.LINKS.get(`plan:${ctx.userId}`)) ?? "trial";
+      const allowsWorkersAi = plan !== "byok";
+      const allowsBYOK = plan !== "trial";
+
+      // Read current provider + per-provider models + configured API keys in one pass
+      const rows = ctx.sql<{ key: string; value: string; encrypted: number }>`
+        SELECT key, value, encrypted FROM agent_config
+        WHERE key = 'provider'
+           OR key LIKE 'model:%'
+           OR key LIKE 'api_key:%'
+      `;
+      const map = new Map(rows.map((r) => [r.key, r]));
+      const currentProvider = map.get("provider")?.value ?? (allowsWorkersAi ? "workers-ai" : "");
+      const currentModel = currentProvider
+        ? (map.get(`model:${currentProvider}`)?.value ?? (allowsWorkersAi ? DEFAULT_MODEL : "(no model)"))
+        : "(none)";
+
+      // ── List mode (no args) ────────────────────────────────────────────
+      if (!arg) {
+        const sections: string[] = [];
+
+        // Workers AI tier (Pro / Trial only)
+        if (allowsWorkersAi) {
+          const waLines = WORKERS_AI_MODELS.map((m) => {
+            const active = currentProvider === "workers-ai" && currentModel === m;
+            return `- \`${m}\`${active ? " **[active]**" : ""}`;
+          });
+          sections.push(`**Workers AI** _(included with your plan)_\n${waLines.join("\n")}`);
+        }
+
+        // BYOK tier (Pro / BYOK only)
+        if (allowsBYOK) {
+          const byokLines: string[] = [];
+          for (const row of rows) {
+            if (!row.key.startsWith("model:")) continue;
+            const provider = row.key.slice(6);
+            if (provider === "workers-ai") continue;
+            const hasKey = map.has(`api_key:${provider}`);
+            if (!hasKey) continue; // BYOK without a key is not usable — don't advertise it
+            const active = provider === currentProvider;
+            byokLines.push(`- \`${provider}\` → \`${row.value}\`${active ? " **[active]**" : ""}`);
+          }
+          if (byokLines.length > 0) {
+            sections.push(`**Your BYOK providers**\n${byokLines.join("\n")}`);
+          } else {
+            sections.push(
+              `**Your BYOK providers**\n_(none configured — add an API key in Settings → Provider)_`,
+            );
+          }
+        }
+
+        const planLabel = plan === "byok" ? "BYOK" : plan === "pro" ? "Pro" : "Trial";
+
+        return {
+          text: [
+            `**Current:** \`${currentProvider || "(none)"}\` / \`${currentModel}\`  _(plan: ${planLabel})_`,
+            "",
+            ...sections,
+            "",
+            "**Switch with:** `/model <provider> <model-id>`",
+            allowsWorkersAi ? "Example: `/model workers-ai @cf/google/gemma-4-26b-a4b-it`" : "",
+            allowsBYOK ? "Example: `/model anthropic claude-sonnet-4-5`" : "",
+          ].filter(Boolean).join("\n"),
+          handled: true,
+        };
+      }
+
+      // ── Switch mode (provider + model-id) ──────────────────────────────
+      const parts = arg.split(/\s+/).filter(Boolean);
+      if (parts.length < 2) {
+        return {
+          text: "Usage: `/model <provider> <model-id>` — run `/model` alone to see what's available on your plan.",
+          handled: true,
+        };
+      }
+      const provider = parts[0].toLowerCase();
+      const modelId = parts.slice(1).join(" ");
+      if (!/^[a-z0-9_-]+$/.test(provider)) {
+        return { text: `Invalid provider slug: \`${provider}\`.`, handled: true };
+      }
+
+      // Plan enforcement — identical rules to the gateway's validateConfigField
+      if (provider === "workers-ai") {
+        if (!allowsWorkersAi) {
+          return {
+            text: "Workers AI models are not available on the BYOK plan. Use one of your configured BYOK providers instead.",
+            handled: true,
+          };
+        }
+        if (!isWorkersAiModel(modelId)) {
+          return {
+            text: `\`${modelId}\` is not a managed Workers AI model. Available: ${WORKERS_AI_MODELS.map((m) => `\`${m}\``).join(", ")}.`,
+            handled: true,
+          };
+        }
+      } else {
+        if (!allowsBYOK) {
+          return {
+            text: "BYOK providers require the Pro plan. Upgrade at clopinette.app/pricing.",
+            handled: true,
+          };
+        }
+        if (!map.has(`api_key:${provider}`)) {
+          return {
+            text: `No API key configured for \`${provider}\`. Add it in Settings → Provider first.`,
+            handled: true,
+          };
+        }
+      }
+
+      ctx.sql`INSERT OR REPLACE INTO agent_config (key, value, encrypted, updated_at)
+        VALUES ('provider', ${provider}, 0, datetime('now'))`;
+      ctx.sql`INSERT OR REPLACE INTO agent_config (key, value, encrypted, updated_at)
+        VALUES (${`model:${provider}`}, ${modelId}, 0, datetime('now'))`;
+      ctx.onCacheInvalidate?.();
+
+      return {
+        text: `Switched to \`${provider}\` / \`${modelId}\`. Next message will use the new model.`,
+        handled: true,
+      };
+    }
+
     case "/personality": {
       if (!arg) {
         // List available personalities
@@ -312,6 +498,8 @@ export async function handleCommand(
         text: [
           "**Available commands:**",
           "/status — Model, tokens, agent info",
+          "/model — Show or switch the active model (`/model <provider> <id>`)",
+          "/insights — Cost breakdown by model this month",
           "/memory — Show persistent memory",
           "/soul — Show personality file",
           "/session — Session info and auto-reset config",
