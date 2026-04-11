@@ -47,6 +47,9 @@ export interface ToolContext {
   globalOutbound?: Fetcher;
   playwrightMcp?: DurableObjectNamespace;
   platform?: import("../config/types.js").Platform;
+  /** Chat id for non-WS platforms (Telegram chatId, WhatsApp phone, Discord channelId).
+   *  Captured by `delegate` so the auto-resume knows where to push the synthesized result. */
+  chatId?: string;
 }
 
 function createUsageTracker(ctx: ToolContext) {

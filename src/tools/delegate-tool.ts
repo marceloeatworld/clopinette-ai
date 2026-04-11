@@ -61,8 +61,10 @@ export function createDelegateTool(ctx: ToolContext & { onToolProgress?: (name: 
 
           // Pre-INSERT the pending row so the eventual onDelegateComplete has somewhere to UPDATE.
           // Doing this before workflow creation means the row exists even if create() races the callback.
-          ctx.sql`INSERT INTO pending_delegates (id, session_id, goal, context, status)
-            VALUES (${id}, ${ctx.sessionId}, ${task.goal}, ${task.context ?? null}, 'queued')`;
+          // platform + chat_id are captured here so the auto-resume that fires when the
+          // last delegate of this session completes knows where to push the synthesized reply.
+          ctx.sql`INSERT INTO pending_delegates (id, session_id, goal, context, status, platform, chat_id)
+            VALUES (${id}, ${ctx.sessionId}, ${task.goal}, ${task.context ?? null}, 'queued', ${ctx.platform ?? null}, ${ctx.chatId ?? null})`;
 
           await workflow.create({
             id,

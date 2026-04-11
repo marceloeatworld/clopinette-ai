@@ -6,6 +6,8 @@ import {
   MEMORY_GUIDANCE,
   CODEMODE_GUIDANCE,
   DELEGATION_GUIDANCE,
+  OPENAI_MODEL_GUIDANCE,
+  GOOGLE_MODEL_GUIDANCE,
   PLATFORM_HINTS,
 } from "./config/constants.js";
 import { PERSONALITIES } from "./config/personalities.js";
@@ -29,6 +31,20 @@ export interface PromptContext {
   honchoContext?: string | null;
   codemodeEnabled?: boolean;
   sharedMode?: boolean;
+  /** Active primary model id — used to inject family-specific operational guidance. */
+  modelId?: string;
+}
+
+/**
+ * Detect which model family the active model belongs to. The substrings are
+ * the same ones hermes uses, plus a few clopinette-specific aliases.
+ */
+function detectModelFamily(modelId: string | undefined): "openai" | "google" | null {
+  if (!modelId) return null;
+  const m = modelId.toLowerCase();
+  if (m.includes("gpt") || m.includes("codex") || m.startsWith("o1") || m.startsWith("o3")) return "openai";
+  if (m.includes("gemini") || m.includes("gemma")) return "google";
+  return null;
 }
 
 export async function buildSystemPrompt(ctx: PromptContext): Promise<string> {
@@ -84,6 +100,14 @@ export async function buildSystemPrompt(ctx: PromptContext): Promise<string> {
 
   // [4] Tool-use enforcement + tool-conditional guidance (Hermes-style)
   blocks.push(TOOL_USE_ENFORCEMENT);
+
+  // [4b] Per-model operational guidance — addresses known failure modes of
+  // each model family (GPT skipping prerequisite tool calls, Gemini guessing
+  // dependencies, etc.). Inert for unknown models.
+  const family = detectModelFamily(ctx.modelId);
+  if (family === "openai") blocks.push(OPENAI_MODEL_GUIDANCE);
+  else if (family === "google") blocks.push(GOOGLE_MODEL_GUIDANCE);
+
   blocks.push(MEMORY_GUIDANCE);
   blocks.push(SESSION_SEARCH_GUIDANCE);
   if (ctx.codemodeEnabled) {

@@ -70,7 +70,7 @@ export interface WhatsAppContext {
   userId: string;
   accessToken: string;
   phoneNumberId: string;
-  runPrompt: (text: string, media?: MediaAsset[], onToolProgress?: (toolName: string, preview: string) => void) => Promise<{ text: string; mediaDelivery?: MediaDelivery[] } | { error: string }>;
+  runPrompt: (text: string, media?: MediaAsset[], onToolProgress?: (toolName: string, preview: string) => void, chatId?: string) => Promise<{ text: string; mediaDelivery?: MediaDelivery[] } | { error: string }>;
   r2Memories: R2Bucket;
   /** Called when a command changes config that affects the system prompt */
   onCacheInvalidate?: () => void;
@@ -98,7 +98,7 @@ export async function handleWhatsAppUpdate(
 
   const msg = change.messages[0];
   const from = msg.from; // phone number (E.164 without +)
-  const text = msg.text?.body ?? msg.image?.caption ?? msg.video?.caption ?? msg.document?.caption ?? "";
+  let text = msg.text?.body ?? msg.image?.caption ?? msg.video?.caption ?? msg.document?.caption ?? "";
 
   // Handle slash commands
   if (text.startsWith("/")) {
@@ -111,9 +111,12 @@ export async function handleWhatsAppUpdate(
       r2Skills: ctx.env.SKILLS,
       onCacheInvalidate: ctx.onCacheInvalidate,
     });
-    if (sharedResult) {
+    if (sharedResult?.handled === true) {
       await sendWhatsAppMessage(ctx.accessToken, ctx.phoneNumberId, from, sharedResult.text);
       return new Response("ok");
+    }
+    if (sharedResult?.handled === false) {
+      text = sharedResult.rewriteAs;
     }
     // WhatsApp-specific commands
     const waReply = await handleWhatsAppOnlyCommand(text, ctx, from);
@@ -184,7 +187,7 @@ export async function handleWhatsAppUpdate(
 
     if (!prompt) return new Response("ok");
 
-    const result = await ctx.runPrompt(prompt, mediaAssets.length > 0 ? mediaAssets : undefined);
+    const result = await ctx.runPrompt(prompt, mediaAssets.length > 0 ? mediaAssets : undefined, undefined, from);
 
     if ("error" in result) {
       await sendWhatsAppMessage(ctx.accessToken, ctx.phoneNumberId, from, `Error: ${result.error}`);

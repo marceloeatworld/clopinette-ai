@@ -84,7 +84,7 @@ export interface DiscordContext {
   userId: string;
   botToken: string;
   applicationId: string;
-  runPrompt: (text: string, media?: MediaAsset[], onToolProgress?: (toolName: string, preview: string) => void) => Promise<{ text: string; mediaDelivery?: MediaDelivery[] } | { error: string }>;
+  runPrompt: (text: string, media?: MediaAsset[], onToolProgress?: (toolName: string, preview: string) => void, chatId?: string) => Promise<{ text: string; mediaDelivery?: MediaDelivery[] } | { error: string }>;
   r2Memories: R2Bucket;
   onCacheInvalidate?: () => void;
 }
@@ -101,8 +101,23 @@ export async function registerDiscordCommands(
       description: "Ask Clopinette anything",
       options: [{ name: "prompt", description: "Your message", type: 3 /* STRING */, required: true }],
     },
+    {
+      name: "research",
+      description: "Deep research with parallel sub-agents",
+      options: [{ name: "topic", description: "What to research", type: 3, required: true }],
+    },
+    {
+      name: "model",
+      description: "Show or switch the active LLM",
+      options: [
+        { name: "provider", description: "Provider slug (e.g. anthropic, workers-ai)", type: 3, required: false },
+        { name: "id", description: "Model id (e.g. claude-sonnet-4-5)", type: 3, required: false },
+      ],
+    },
+    { name: "insights", description: "Cost breakdown by model this month" },
     { name: "status", description: "Model, tokens, agent info" },
     { name: "memory", description: "Show persistent memory" },
+    { name: "forget", description: "Clear MEMORY.md and USER.md" },
     { name: "skills", description: "List installed skills" },
     { name: "search", description: "Search past conversations", options: [{ name: "query", description: "Search query", type: 3, required: true }] },
     { name: "session", description: "Session info and auto-reset config" },
@@ -232,7 +247,12 @@ export async function processInteractionDeferred(
   ctx: DiscordContext,
 ): Promise<void> {
   const commandName = interaction.data!.name;
-  const arg = interaction.data!.options?.[0]?.value ?? "";
+  // Join ALL option values so multi-option commands like `/model <provider> <id>`
+  // produce `provider id` instead of just the first option's value.
+  const arg = (interaction.data!.options ?? [])
+    .map((o) => String(o.value ?? ""))
+    .filter(Boolean)
+    .join(" ");
 
   // /ask — run through the full pipeline
   if (commandName === "ask") {
@@ -261,6 +281,15 @@ export async function processInteractionDeferred(
     onCacheInvalidate: ctx.onCacheInvalidate,
   });
 
+  if (sharedResult?.handled === false) {
+    // Rewrite mode (e.g. /research) — run the rewritten prompt through the pipeline
+    // and edit the original deferred response with the synthesized answer.
+    const result = await ctx.runPrompt(sharedResult.rewriteAs, undefined, undefined, interaction.channel_id);
+    const reply = "error" in result ? `Error: ${result.error}` : result.text;
+    await editOriginalResponse(ctx.applicationId, interaction.token, reply || "Done.");
+    return;
+  }
+
   await editOriginalResponse(
     ctx.applicationId,
     interaction.token,
@@ -279,7 +308,7 @@ export async function handleDiscordMessage(
   ctx: DiscordContext,
 ): Promise<void> {
   const channelId = message.channel_id;
-  const text = message.content ?? "";
+  let text = message.content ?? "";
 
   // Handle slash commands (typed manually in DMs, e.g. "/status")
   if (text.startsWith("/")) {
@@ -292,9 +321,12 @@ export async function handleDiscordMessage(
       r2Skills: ctx.env.SKILLS,
       onCacheInvalidate: ctx.onCacheInvalidate,
     });
-    if (sharedResult) {
+    if (sharedResult?.handled === true) {
       await sendDiscordMessage(ctx.botToken, channelId, sharedResult.text);
       return;
+    }
+    if (sharedResult?.handled === false) {
+      text = sharedResult.rewriteAs;
     }
     // Discord-specific commands
     const dcReply = await handleDiscordOnlyCommand(text, ctx, message.author.id, message.guild_id);
@@ -361,7 +393,7 @@ export async function handleDiscordMessage(
         }
       : undefined;
 
-    const result = await ctx.runPrompt(prompt, mediaAssets.length > 0 ? mediaAssets : undefined, onToolProgress);
+    const result = await ctx.runPrompt(prompt, mediaAssets.length > 0 ? mediaAssets : undefined, onToolProgress, channelId);
 
     clearInterval(typingInterval);
 

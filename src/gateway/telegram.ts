@@ -46,7 +46,7 @@ export interface TelegramContext {
   userId: string;
   botToken: string;
   /** Pipeline callback — runs the prompt through the full agent pipeline */
-  runPrompt: (text: string, media?: MediaAsset[], onToolProgress?: (toolName: string, preview: string) => void) => Promise<{ text: string; mediaDelivery?: MediaDelivery[] } | { error: string }>;
+  runPrompt: (text: string, media?: MediaAsset[], onToolProgress?: (toolName: string, preview: string) => void, chatId?: string) => Promise<{ text: string; mediaDelivery?: MediaDelivery[] } | { error: string }>;
   /** R2 bucket for fetching generated media */
   r2Memories: R2Bucket;
   /** Called when a command changes config that affects the system prompt */
@@ -95,7 +95,11 @@ export async function registerTelegramWebhook(
       body: JSON.stringify({
         commands: [
           { command: "status", description: "Model, tokens, agent info" },
+          { command: "research", description: "Deep research with parallel sub-agents" },
+          { command: "model", description: "Show or switch the active LLM" },
+          { command: "insights", description: "Cost breakdown by model this month" },
           { command: "memory", description: "Show persistent memory" },
+          { command: "forget", description: "Clear MEMORY.md and USER.md" },
           { command: "skills", description: "List installed skills" },
           { command: "search", description: "Search past conversations" },
           { command: "soul", description: "Show personality file" },
@@ -183,7 +187,7 @@ export async function handleTelegramUpdate(
   }
 
   const msg = update.message;
-  const text = msg?.text ?? msg?.caption ?? "";
+  let text = msg?.text ?? msg?.caption ?? "";
   const chatId = msg?.chat.id;
 
   const messageId = msg?.message_id;
@@ -222,9 +226,13 @@ export async function handleTelegramUpdate(
       r2Skills: ctx.env.SKILLS,
       onCacheInvalidate: ctx.onCacheInvalidate,
     });
-    if (sharedResult) {
+    if (sharedResult?.handled === true) {
       await sendTelegramMessage(botToken, chatId, escapeMarkdownV2(sharedResult.text), messageId);
       return new Response("ok");
+    }
+    if (sharedResult?.handled === false) {
+      // Rewrite mode (e.g. /research) — replace user text and continue to runPrompt.
+      text = sharedResult.rewriteAs;
     }
     // Telegram-specific commands (/start, /link)
     const chatTitle = msg?.chat.title ?? msg?.from?.first_name;
@@ -335,7 +343,7 @@ export async function handleTelegramUpdate(
         }
       : undefined;
 
-    const result = await ctx.runPrompt(prompt, mediaAssets.length > 0 ? mediaAssets : undefined, onToolProgress);
+    const result = await ctx.runPrompt(prompt, mediaAssets.length > 0 ? mediaAssets : undefined, onToolProgress, String(chatId));
 
     clearInterval(typingInterval);
 

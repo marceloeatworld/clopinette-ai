@@ -1,5 +1,6 @@
 import { WorkflowEntrypoint, type WorkflowEvent, type WorkflowStep } from "cloudflare:workers";
 import { generateText, stepCountIs } from "ai";
+import { getAgentByName } from "agents";
 import { createWebTool } from "./tools/web-tool.js";
 import { createBrowserTool } from "./tools/browser-tool.js";
 import {
@@ -97,7 +98,10 @@ export class DelegateWorkflow extends WorkflowEntrypoint<Env, DelegateWorkflowPa
       // Fetch the parent user's inference config + plan via RPC. The DO holds
       // the master key — only it can decrypt API keys. This keeps BYOK delegates
       // routed through the user's own provider instead of our Workers AI.
-      const stub = this.env.CLOPINETTE_AGENT.get(this.env.CLOPINETTE_AGENT.idFromName(userId));
+      // getAgentByName sets `.name` on the stub — without this, this.queue() in
+      // onDelegateComplete throws "Attempting to read .name on ClopinetteAgent
+      // before it was set" because cross-worker RPC bypasses the routing layer.
+      const stub = await getAgentByName(this.env.CLOPINETTE_AGENT, userId);
       let model;
       let auxiliary;
       try {
@@ -225,7 +229,10 @@ export class DelegateWorkflow extends WorkflowEntrypoint<Env, DelegateWorkflowPa
       "notify_parent",
       { retries: { limit: 3, delay: "2 seconds", backoff: "exponential" }, timeout: "30 seconds" },
       async () => {
-        const stub = this.env.CLOPINETTE_AGENT.get(this.env.CLOPINETTE_AGENT.idFromName(userId));
+        // getAgentByName instead of raw .get(idFromName) — required so that
+        // this.name is set on the DO. The auto-resume scheduler in
+        // onDelegateComplete uses this.queue() which depends on this.name.
+        const stub = await getAgentByName(this.env.CLOPINETTE_AGENT, userId);
         await stub.onDelegateComplete({
           id,
           sessionId,

@@ -40,7 +40,7 @@ Supporting Cloudflare services (used transparently):
 - **BYOK** — bring your own key across 12 providers (OpenAI, Anthropic, Groq, xAI, Mistral, DeepSeek, …) via the Cloudflare AI Gateway
 - **Cross-provider auxiliary** — e.g. primary OpenAI + auxiliary Anthropic for the fast-path / compression
 - **Self-learning** — the agent updates its own memory after N turns
-- **Async delegation** — sub-agents run in the background, results injected in the next turn (no blocking the chat)
+- **Async delegation with auto-resume** — sub-agents run in parallel via Cloudflare Workflows. When the last delegate finishes, the agent automatically synthesizes their results and pushes the final reply via the originating gateway (web / Telegram / WhatsApp / Discord). No need to send a follow-up message.
 - **Multimodal** — vision (images), Whisper (voice), PDF / DOCX / XLSX / text extraction
 
 ## Tools
@@ -72,6 +72,9 @@ Work on every platform (web, Telegram, WhatsApp, Discord).
 | Command | Description |
 |---|---|
 | `/status` | Model, tokens, session info |
+| `/research <topic>` | Deep research with parallel sub-agents (auto-synthesized reply) |
+| `/model [provider id]` | Show or switch the active LLM (plan-aware) |
+| `/insights` | Cost breakdown by model this month (USD estimate) |
 | `/memory` | Show MEMORY.md and USER.md |
 | `/soul` | Show SOUL.md personality (`/soul reset` to restore default) |
 | `/personality [name]` | Switch personality or list the 14 presets |
@@ -82,7 +85,7 @@ Work on every platform (web, Telegram, WhatsApp, Discord).
 | `/notes` | List all notes grouped by day |
 | `/forget` | Clear memory |
 | `/reset` or `/clear` | Reset current session |
-| `/wipe CONFIRM` | Delete everything (irreversible) |
+| `/wipe CONFIRM` | Delete everything except your BYOK provider config |
 | `/link` | Generate identity linking code (Telegram / WhatsApp / Discord) |
 | `/help` | List all commands |
 

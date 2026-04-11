@@ -53,6 +53,9 @@ export interface PipelineContext {
   platform: Platform;
   userId: string;
   sessionId: string;
+  /** Chat id for non-WS platforms — propagated to ToolContext so `delegate` can persist
+   *  it on `pending_delegates` for the auto-resume push. */
+  chatId?: string;
   /** User's billing plan — drives BYOK enforcement (no Workers AI fallback for BYOK). */
   plan?: Plan;
 
@@ -130,7 +133,8 @@ export interface ElicitParams {
  */
 export type BackgroundTask =
   | { type: "selfLearning"; summary: string; userId: string; sessionId: string; options: { reviewMemory: boolean; reviewSkills: boolean } }
-  | { type: "r2ContextUpdate"; r2Key: string; context: string };
+  | { type: "r2ContextUpdate"; r2Key: string; context: string }
+  | { type: "delegateResume"; sessionId: string; platform: string | null; chatId: string | null };
 
 export interface PipelineUsage {
   inputTokens: number;
@@ -626,6 +630,7 @@ async function runPipelineInner(
       honchoContext,
       codemodeEnabled,
       sharedMode: ctx.sharedMode,
+      modelId: config.model,
     });
     ctx.onCacheSystemPrompt?.(systemPrompt);
   }
@@ -670,6 +675,7 @@ async function runPipelineInner(
     globalOutbound: codemodeEnabled ? ctx.env.CODEMODE_OUTBOUND : undefined,
     playwrightMcp: ctx.env.PlaywrightMCP,
     platform: ctx.platform,
+    chatId: ctx.chatId,
   };
   const tools = codemodeEnabled ? resolveTools(toolCtx) : buildTools(toolCtx);
 
@@ -1112,6 +1118,24 @@ function extractMediaDelivery(steps: unknown): MediaDelivery[] {
 // ───────────────────────── Auxiliary usage tracking ─────────────────────────
 
 /**
+ * Atomic increment of the durable monthly token counter.
+ *
+ * Stored in `monthly_tokens` (separate from `sessions.total_tokens`) so that
+ * `/reset` and `/wipe` — which both DELETE FROM sessions — don't blow away the
+ * count the dashboard displays. The PRIMARY KEY on month makes the UPSERT
+ * race-safe across concurrent inference calls.
+ */
+export function incrementMonthlyTokens(sql: SqlFn, tokensAdded: number): void {
+  if (tokensAdded <= 0) return;
+  const month = new Date().toISOString().slice(0, 7); // YYYY-MM
+  sql`INSERT INTO monthly_tokens (month, total, updated_at)
+      VALUES (${month}, ${tokensAdded}, datetime('now'))
+      ON CONFLICT(month) DO UPDATE SET
+        total = total + ${tokensAdded},
+        updated_at = datetime('now')`;
+}
+
+/**
  * Reports token usage to the gateway via Cloudflare Queues.
  *
  * Durable by design:
@@ -1128,6 +1152,7 @@ export function trackAuxiliaryUsage(
   const tokens = tokensIn + tokensOut;
   if (tokens <= 0) return;
   sql`UPDATE sessions SET total_tokens = total_tokens + ${tokens} WHERE id = ${sessionId}`;
+  incrementMonthlyTokens(sql, tokens);
   env.USAGE_QUEUE.send({
     userId, tokensIn, tokensOut, model, sessionId, timestamp: Date.now(),
   });
@@ -1168,6 +1193,9 @@ function afterInference(
     const tokens = (usage.inputTokens ?? 0) + (usage.outputTokens ?? 0);
     ctx.sql`UPDATE sessions SET total_tokens = total_tokens + ${tokens}, updated_at = datetime('now')
       WHERE id = ${ctx.sessionId}`;
+
+    // Durable monthly counter — survives /reset and /wipe (which both DELETE FROM sessions)
+    incrementMonthlyTokens(ctx.sql, tokens);
 
     // Gateway usage reporting via Cloudflare Queue (retry-safe, DLQ-backed)
     ctx.env.USAGE_QUEUE.send({

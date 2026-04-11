@@ -105,6 +105,33 @@ export class ClopinetteAgent extends AIChatAgent<Env, AgentState> {
     }
   }
 
+  /**
+   * Read the durable monthly token counter, with one-shot bootstrap from
+   * `sessions.total_tokens` for users who pre-date the new counter.
+   *
+   * The counter row is created on first read if missing AND there's something
+   * to bootstrap (so we don't write a useless `total: 0` row for fresh DOs).
+   * Subsequent increments come from `incrementMonthlyTokens` in pipeline.ts.
+   */
+  #readMonthlyTokenCounter(): number {
+    const month = new Date().toISOString().slice(0, 7);
+    const row = this.sql<{ total: number }>`
+      SELECT total FROM monthly_tokens WHERE month = ${month}
+    `;
+    if (row.length > 0) return row[0].total ?? 0;
+
+    // Bootstrap from existing sessions data (first run after the migration).
+    const monthStart = `${month}-01`;
+    const bootstrap = this.sql<{ total: number }>`
+      SELECT COALESCE(SUM(total_tokens), 0) as total FROM sessions WHERE started_at >= ${monthStart}
+    `;
+    const total = bootstrap[0]?.total ?? 0;
+    if (total > 0) {
+      this.sql`INSERT INTO monthly_tokens (month, total) VALUES (${month}, ${total})`;
+    }
+    return total;
+  }
+
   /** Load plan, quota and token totals from KV + SQLite into the broadcasted AgentState. */
   async #hydrateAgentState(): Promise<void> {
     try {
@@ -118,11 +145,10 @@ export class ClopinetteAgent extends AIChatAgent<Env, AgentState> {
         try { quota = JSON.parse(quotaRaw); } catch { /* malformed */ }
       }
 
-      // Monthly token usage — sum of the current month's sessions
-      const monthStart = `${new Date().toISOString().slice(0, 7)}-01`;
-      const monthly = this.sql<{ total: number }>`
-        SELECT COALESCE(SUM(total_tokens), 0) as total FROM sessions WHERE started_at >= ${monthStart}
-      `;
+      // Monthly token usage — read from the durable counter (survives /reset & /wipe).
+      // First-run / migration: bootstrap from sessions.total_tokens once, then the
+      // counter takes over and is incremented atomically by `incrementMonthlyTokens`.
+      const tokensThisMonth = this.#readMonthlyTokenCounter();
 
       // Pending delegates still running for this user
       const pending = this.sql<{ id: string; goal: string; created_at: string }>`
@@ -134,7 +160,7 @@ export class ClopinetteAgent extends AIChatAgent<Env, AgentState> {
       this.setState({
         ...this.state,
         plan,
-        tokensThisMonth: monthly[0]?.total ?? 0,
+        tokensThisMonth,
         quotaAllowed: quota?.allowed ?? true,
         quotaReason: quota?.reason,
         pendingDelegates: pending.map((p) => ({ id: p.id, goal: p.goal, startedAt: p.created_at })),
@@ -256,7 +282,7 @@ export class ClopinetteAgent extends AIChatAgent<Env, AgentState> {
         sessionId: this.#sessionId!,
         userId: this.#userId,
         botToken,
-        runPrompt: (text, media, onToolProgress) => this.runPrompt(text, "telegram", media, onToolProgress),
+        runPrompt: (text, media, onToolProgress, chatId) => this.runPrompt(text, "telegram", media, onToolProgress, chatId),
         r2Memories: this.env.MEMORIES,
         onCacheInvalidate: () => {
           this.#cachedSystemPrompt = null;
@@ -288,7 +314,7 @@ export class ClopinetteAgent extends AIChatAgent<Env, AgentState> {
         userId: this.#userId,
         accessToken,
         phoneNumberId,
-        runPrompt: (text, media, onToolProgress) => this.runPrompt(text, "whatsapp", media, onToolProgress),
+        runPrompt: (text, media, onToolProgress, chatId) => this.runPrompt(text, "whatsapp", media, onToolProgress, chatId),
         r2Memories: this.env.MEMORIES,
         onCacheInvalidate: () => {
           this.#cachedSystemPrompt = null;
@@ -311,7 +337,7 @@ export class ClopinetteAgent extends AIChatAgent<Env, AgentState> {
         apiUrl: this.env.EVOLUTION_API_URL!,
         apiKey: this.env.EVOLUTION_API_KEY!,
         instanceName,
-        runPrompt: (text, media, onToolProgress) => this.runPrompt(text, "whatsapp", media, onToolProgress),
+        runPrompt: (text, media, onToolProgress, chatId) => this.runPrompt(text, "whatsapp", media, onToolProgress, chatId),
         r2Memories: this.env.MEMORIES,
         onCacheInvalidate: () => {
           this.#cachedSystemPrompt = null;
@@ -335,8 +361,8 @@ export class ClopinetteAgent extends AIChatAgent<Env, AgentState> {
         userId: this.#userId,
         botToken,
         applicationId,
-        runPrompt: (text: string, media?: MediaAsset[], onToolProgress?: (toolName: string, preview: string) => void) =>
-          this.runPrompt(text, "discord", media, onToolProgress),
+        runPrompt: (text: string, media?: MediaAsset[], onToolProgress?: (toolName: string, preview: string) => void, chatId?: string) =>
+          this.runPrompt(text, "discord", media, onToolProgress, chatId),
         r2Memories: this.env.MEMORIES,
         onCacheInvalidate: () => {
           this.#cachedSystemPrompt = null;
@@ -415,7 +441,7 @@ export class ClopinetteAgent extends AIChatAgent<Env, AgentState> {
         });
       }
     }
-    const cleanUserText = userText.replace(mediaPattern, "").trim();
+    let cleanUserText = userText.replace(mediaPattern, "").trim();
 
     // Handle slash commands (/reset, /memory, /forget, /wipe, etc.) — works on ALL gateways
     const cmdResult = await handleCommand(cleanUserText, {
@@ -430,13 +456,18 @@ export class ClopinetteAgent extends AIChatAgent<Env, AgentState> {
         this.#cachedInferenceConfig = null;
       },
     });
-    if (cmdResult) {
+    if (cmdResult?.handled === true) {
       // Send directly over WS — HTTP Responses from onChatMessage are not
       // surfaced to the frontend in the cf_agent_use_chat protocol
       for (const ws of this.ctx.getWebSockets()) {
         ws.send(JSON.stringify({ type: "command_result", text: cmdResult.text }));
       }
       return;
+    }
+    if (cmdResult?.handled === false) {
+      // Rewrite mode (e.g. /research) — replace user text with the structured
+      // prompt and continue through the normal pipeline.
+      cleanUserText = cmdResult.rewriteAs;
     }
 
     const recentToolUse = this.messages.slice(-5).some(m =>
@@ -538,13 +569,19 @@ export class ClopinetteAgent extends AIChatAgent<Env, AgentState> {
 
   /**
    * Run a prompt through the full pipeline (non-streaming).
-   * Used by Telegram, cron, and any future gateway.
+   * Used by Telegram, cron, delegate auto-resume, and any future gateway.
+   *
+   * `chatId` is the platform-native conversation id (Telegram chat id, WhatsApp
+   * phone, Discord channel id, Evolution remoteJid). Captured here so the
+   * `delegate` tool can persist it on `pending_delegates` and the auto-resume
+   * push knows where to deliver the synthesized result.
    */
   async runPrompt(
     userText: string,
     platform: Platform,
     mediaAssets?: MediaAsset[],
     onToolProgress?: (toolName: string, preview: string) => void,
+    chatId?: string,
   ): Promise<{ text: string } | { error: string }> {
     // Serial queue with 30s timeout. Messages wait their turn to avoid context mixing.
     // If a previous prompt is stuck for >30s, proceed concurrently as fallback.
@@ -554,9 +591,9 @@ export class ClopinetteAgent extends AIChatAgent<Env, AgentState> {
     ]);
     if (raceResult === "timeout") {
       console.warn("[queue] Previous prompt still running after 10s, proceeding concurrently");
-      return this.#runPromptInner(userText, platform, mediaAssets, onToolProgress);
+      return this.#runPromptInner(userText, platform, mediaAssets, onToolProgress, chatId);
     }
-    const task = this.#promptQueue.then(() => this.#runPromptInner(userText, platform, mediaAssets, onToolProgress));
+    const task = this.#promptQueue.then(() => this.#runPromptInner(userText, platform, mediaAssets, onToolProgress, chatId));
     this.#promptQueue = task.catch(() => {});
     return task;
   }
@@ -566,11 +603,13 @@ export class ClopinetteAgent extends AIChatAgent<Env, AgentState> {
     platform: Platform,
     mediaAssets?: MediaAsset[],
     onToolProgress?: (toolName: string, preview: string) => void,
+    chatId?: string,
   ): Promise<{ text: string; mediaDelivery?: import("./pipeline.js").MediaDelivery[] } | { error: string }> {
     await this.#ensureSession(platform);
     const sqlBound = this.sql.bind(this);
 
     // Handle slash commands (/reset, /memory, /forget, /wipe, etc.)
+    let effectiveUserText = userText;
     const cmdResult = await handleCommand(userText, {
       sql: sqlBound,
       sessionId: this.#sessionId!,
@@ -583,7 +622,11 @@ export class ClopinetteAgent extends AIChatAgent<Env, AgentState> {
         this.#cachedInferenceConfig = null;
       },
     });
-    if (cmdResult) return { text: cmdResult.text };
+    if (cmdResult?.handled === true) return { text: cmdResult.text };
+    if (cmdResult?.handled === false) {
+      // Rewrite mode (e.g. /research) — replace user text and run the pipeline.
+      effectiveUserText = cmdResult.rewriteAs;
+    }
 
     // Always load conversation history — even for simple messages, the fast path
     // now keeps context so the agent doesn't "forget" what was just said
@@ -598,11 +641,12 @@ export class ClopinetteAgent extends AIChatAgent<Env, AgentState> {
         platform,
         userId: this.#userId,
         sessionId: this.#sessionId!,
+        chatId,
         plan: coercePlan(this.state.plan),
         sql: sqlBound,
         env: this.env,
-        messages: [...messages, { role: "user" as const, content: userText }],
-        userText,
+        messages: [...messages, { role: "user" as const, content: effectiveUserText }],
+        userText: effectiveUserText,
         mediaAssets,
         enableCodemode: !!this.env.LOADER,
         enableCompression: false,
@@ -742,7 +786,10 @@ export class ClopinetteAgent extends AIChatAgent<Env, AgentState> {
       configuredAuxiliaryModels,
       platform: this.state.platform,
       status: this.state.status,
-      configuredKeys: rows.map((r) => r.key),
+      // Internal keys (starting with `_`) are pipeline state — turn counter,
+      // delegate sentinels, schema version. They are not user-configurable
+      // and should not appear in the dashboard "Configured keys" list.
+      configuredKeys: rows.map((r) => r.key).filter((k) => !k.startsWith("_")),
     };
   }
 
@@ -1268,16 +1315,20 @@ export class ClopinetteAgent extends AIChatAgent<Env, AgentState> {
   /**
    * Called by `DelegateWorkflow` via cross-worker RPC when a delegated task finishes.
    *
-   * Flow (hermes-agent notify_on_complete pattern — PR #5779):
-   * 1. Update the `pending_delegates` row
-   * 2. Inject a synthetic system message into `session_messages` so the next parent turn
-   *    sees the result in its context, without needing to block on the delegate
-   * 3. Mirror the summary to FTS5 so it becomes searchable like any other message
-   * 4. Push a WebSocket message so the live dashboard reflects completion immediately
+   * Flow (hermes-agent notify_on_complete pattern — PR #5779, extended with auto-resume):
+   * 1. Lookup row + reject if already processed (`completed_at` already set ⇒ retry)
+   * 2. UPDATE the row with the result (sets `completed_at`, becomes the dedup marker)
+   * 3. Inject a synthetic system message into `session_messages`
+   * 4. Track auxiliary token usage
+   * 5. Push WS `delegate_result` so the live dashboard updates immediately
+   * 6. If this is the LAST queued/running delegate of the session, schedule the
+   *    `delegateResume` background task. That task runs a fresh LLM turn over the
+   *    delegate summaries and dispatches the synthesized reply via the originating
+   *    gateway (web / Telegram / WhatsApp / Discord).
    *
-   * Crucially, this does NOT re-trigger a parent LLM turn. The user will get the result
-   * whenever they next say something — the synthetic system message gives the model full
-   * context at that point.
+   * Idempotency: the entire body runs inside `blockConcurrencyWhile`, so two
+   * concurrent completions are serialized. The completed_at-based dedup at the
+   * top makes the handler safe against `notify_parent` retries.
    */
   @callable()
   async onDelegateComplete(result: {
@@ -1291,54 +1342,100 @@ export class ClopinetteAgent extends AIChatAgent<Env, AgentState> {
     tokensOut: number;
   }): Promise<{ ok: true }> {
     const { id, sessionId, status, summary, toolTrace, durationSeconds, tokensIn, tokensOut } = result;
+    const sqlBound = this.sql.bind(this);
 
-    // 1. Update pending_delegates row (may not exist if the DO was wiped between create and complete)
-    this.sql`UPDATE pending_delegates
-      SET status = ${status}, summary = ${summary}, tool_trace = ${JSON.stringify(toolTrace)},
-          tokens_in = ${tokensIn}, tokens_out = ${tokensOut},
-          duration_seconds = ${durationSeconds}, completed_at = datetime('now')
-      WHERE id = ${id}`;
+    let scheduleResume: { platform: string | null; chatId: string | null } | null = null;
+    let pushPayload: { goal: string; statusOut: string } | null = null;
 
-    // 2. Look up the goal so the injected message has context
-    const row = this.sql<{ goal: string }>`SELECT goal FROM pending_delegates WHERE id = ${id}`;
-    const goal = row[0]?.goal ?? "(unknown goal)";
+    await this.ctx.blockConcurrencyWhile(async () => {
+      // 1. Lookup the row + dedup against retries (completed_at already set ⇒ no-op)
+      const existing = sqlBound<{
+        goal: string; platform: string | null; chat_id: string | null; completed_at: string | null;
+      }>`
+        SELECT goal, platform, chat_id, completed_at FROM pending_delegates WHERE id = ${id}`;
+      if (existing.length === 0) {
+        // Row missing — DO was wiped between create and complete. Nothing to do.
+        return;
+      }
+      if (existing[0].completed_at) {
+        // Retry of a notify_parent that already succeeded once. Drop silently.
+        return;
+      }
+      const goal = existing[0].goal;
+      const platform = existing[0].platform;
+      const chatId = existing[0].chat_id;
 
-    // 3. Inject synthetic system message into the session history
-    const tag = status === "success" ? "completed" : "failed";
-    const toolList = toolTrace.length > 0 ? ` (${toolTrace.join(", ")})` : "";
-    const content = `[Delegate ${tag} in ${durationSeconds}s${toolList}]\nGoal: ${goal}\n\n${summary}`;
-    this.sql`INSERT INTO session_messages (session_id, role, content) VALUES (${sessionId}, ${"system"}, ${content})`;
+      // 2. UPDATE the row — completed_at becomes the dedup marker for future retries
+      sqlBound`UPDATE pending_delegates
+        SET status = ${status}, summary = ${summary}, tool_trace = ${JSON.stringify(toolTrace)},
+            tokens_in = ${tokensIn}, tokens_out = ${tokensOut},
+            duration_seconds = ${durationSeconds}, completed_at = datetime('now')
+        WHERE id = ${id}`;
 
-    // 4. Track tokens + report usage (queue-backed)
-    if (tokensIn > 0 || tokensOut > 0) {
-      const { trackAuxiliaryUsage } = await import("./pipeline.js");
-      trackAuxiliaryUsage(
-        this.sql.bind(this), sessionId, tokensIn, tokensOut,
-        "delegate-workflow", this.env, this.#userId,
-      );
-    }
+      // 3. Inject synthetic system message into the session history
+      const tag = status === "success" ? "completed" : "failed";
+      const toolList = toolTrace.length > 0 ? ` (${toolTrace.join(", ")})` : "";
+      const content = `[Delegate ${tag} in ${durationSeconds}s${toolList}]\nGoal: ${goal}\n\n${summary}`;
+      sqlBound`INSERT INTO session_messages (session_id, role, content) VALUES (${sessionId}, ${"system"}, ${content})`;
 
-    // 5. Remove from pendingDelegates live state and broadcast
-    this.setState({
-      ...this.state,
-      pendingDelegates: this.state.pendingDelegates.filter((d) => d.id !== id),
+      // 4. Track tokens + report usage (queue-backed)
+      if (tokensIn > 0 || tokensOut > 0) {
+        const { trackAuxiliaryUsage } = await import("./pipeline.js");
+        trackAuxiliaryUsage(
+          sqlBound, sessionId, tokensIn, tokensOut,
+          "delegate-workflow", this.env, this.#userId,
+        );
+      }
+
+      // 5. Remove from pendingDelegates live state
+      this.setState({
+        ...this.state,
+        pendingDelegates: this.state.pendingDelegates.filter((d) => d.id !== id),
+      });
+      pushPayload = { goal, statusOut: status };
+
+      logAudit(sqlBound, "delegate.complete", `${id}:${status}`);
+
+      // 6. Last-delegate check — only schedule the resume here, since we hold
+      // the lock and the UPDATE above has already landed.
+      const remaining = sqlBound<{ cnt: number }>`
+        SELECT COUNT(*) AS cnt FROM pending_delegates
+        WHERE session_id = ${sessionId} AND status IN ('queued', 'running')
+      `;
+      if ((remaining[0]?.cnt ?? 0) === 0) {
+        scheduleResume = { platform, chatId };
+      }
     });
 
-    // 6. Push to any connected WebSocket so the frontend sees it live
-    for (const ws of this.ctx.getWebSockets()) {
-      try {
-        ws.send(JSON.stringify({
-          type: "delegate_result",
-          id,
-          status,
-          goal,
-          summary,
-          durationSeconds,
-        }));
-      } catch { /* socket closed */ }
+    // The WS push and queue() schedule happen OUTSIDE the lock so the lock window
+    // stays as small as possible. Both are no-ops if the dedup branch fired.
+    if (pushPayload) {
+      const payload = pushPayload as { goal: string; statusOut: string };
+      for (const ws of this.ctx.getWebSockets()) {
+        try {
+          ws.send(JSON.stringify({
+            type: "delegate_result",
+            id,
+            status: payload.statusOut,
+            goal: payload.goal,
+            summary,
+            durationSeconds,
+          }));
+        } catch { /* socket closed */ }
+      }
     }
 
-    logAudit(this.sql.bind(this), "delegate.complete", `${id}:${status}`);
+    if (scheduleResume) {
+      const target = scheduleResume as { platform: string | null; chatId: string | null };
+      this.queue("executeBackgroundTask" as keyof this, {
+        type: "delegateResume",
+        sessionId,
+        platform: target.platform,
+        chatId: target.chatId,
+      } satisfies import("./pipeline.js").BackgroundTask).catch((err) =>
+        console.warn("Failed to queue delegateResume task:", err));
+    }
+
     return { ok: true };
   }
 
@@ -1426,8 +1523,46 @@ export class ClopinetteAgent extends AIChatAgent<Env, AgentState> {
     const target = job.deliver ?? "origin";
     const platform = target === "origin" ? job.platform : target.split(":")[0];
     const chatId = target === "origin" ? job.chat_id : target.split(":")[1] ?? job.chat_id;
+    await this.#deliverToOrigin(platform, chatId, text);
+  }
 
-    if (!platform || !chatId) return;
+  /**
+   * Generic delivery helper — push a synthesized text reply back to the originating
+   * conversation. Used by both `#deliverCronResult` and the delegate auto-resume.
+   *
+   * For websocket sessions there is no chat_id, so we fan-out to every connected WS
+   * as a delegate-style assistant message. For Telegram / WhatsApp / Discord / Evolution
+   * we dispatch via the gateway-specific send functions.
+   */
+  async #deliverToOrigin(
+    platform: string | null | undefined,
+    chatId: string | null | undefined,
+    text: string,
+  ): Promise<void> {
+    if (!text) return;
+
+    // Web / API sessions — broadcast to any connected WebSocket. The frontend
+    // already handles `delegate_result` and renders it as an assistant message.
+    if (!platform || platform === "websocket" || platform === "api") {
+      for (const ws of this.ctx.getWebSockets()) {
+        try {
+          ws.send(JSON.stringify({
+            type: "delegate_result",
+            id: crypto.randomUUID(),
+            status: "success",
+            goal: "Auto-resume",
+            summary: text,
+            durationSeconds: 0,
+          }));
+        } catch { /* socket closed */ }
+      }
+      return;
+    }
+
+    if (!chatId) {
+      console.warn(`[deliverToOrigin] platform=${platform} but chatId missing — dropping reply`);
+      return;
+    }
 
     switch (platform) {
       case "telegram": {
@@ -1436,11 +1571,18 @@ export class ClopinetteAgent extends AIChatAgent<Env, AgentState> {
         break;
       }
       case "whatsapp": {
+        // Try Meta Cloud API first; fall back to Evolution if configured
         const accessToken = this.env.WHATSAPP_ACCESS_TOKEN;
         const phoneId = this.env.WHATSAPP_PHONE_NUMBER_ID;
         if (accessToken && phoneId) {
           const { sendWhatsAppMessage } = await import("./gateway/whatsapp.js");
           await sendWhatsAppMessage(accessToken, phoneId, chatId, text);
+        } else if (this.env.EVOLUTION_API_URL && this.env.EVOLUTION_API_KEY) {
+          const { sendEvolutionMessage } = await import("./gateway/evolution.js");
+          await sendEvolutionMessage(
+            this.env.EVOLUTION_API_URL, this.env.EVOLUTION_API_KEY,
+            `clop-${this.#userId}`, chatId, text,
+          );
         }
         break;
       }
@@ -1450,7 +1592,7 @@ export class ClopinetteAgent extends AIChatAgent<Env, AgentState> {
         break;
       }
       default:
-        console.log(`Cron delivery: no handler for platform "${platform}"`);
+        console.warn(`[deliverToOrigin] no handler for platform "${platform}"`);
     }
   }
 
@@ -1595,6 +1737,65 @@ export class ClopinetteAgent extends AIChatAgent<Env, AgentState> {
         case "r2ContextUpdate": {
           const { updateContext } = await import("./media/handler.js");
           await updateContext(this.env.MEMORIES, task.r2Key, task.context);
+          break;
+        }
+        case "delegateResume": {
+          // Build the synthesis prompt INLINE from pending_delegates rows.
+          // We can't rely on the synthetic system messages we inject in
+          // session_messages — `#runPromptInner` filters role='system' out
+          // of history before calling runPipeline, so the LLM would see the
+          // synthesis instruction but none of the delegate results.
+          //
+          // Instead we construct a single user message that contains every
+          // completed delegate summary verbatim, plus the instruction to
+          // synthesize. This works on all platforms uniformly.
+          const sqlBound = this.sql.bind(this);
+          const completed = sqlBound<{
+            goal: string; status: string; summary: string | null; duration_seconds: number;
+          }>`
+            SELECT goal, status, summary, duration_seconds FROM pending_delegates
+            WHERE session_id = ${task.sessionId}
+              AND status IN ('success', 'error')
+              AND summary IS NOT NULL
+            ORDER BY completed_at ASC
+          `;
+
+          if (completed.length === 0) {
+            console.warn(`[delegateResume] no completed delegates for session ${task.sessionId}`);
+            break;
+          }
+
+          const blocks = completed.map((d, i) => {
+            const tag = d.status === "success" ? "✓" : "✗";
+            return `### Delegate ${i + 1} ${tag} (${d.duration_seconds}s)\n**Goal:** ${d.goal}\n\n${d.summary}`;
+          }).join("\n\n---\n\n");
+
+          const synthetic =
+            "[SYSTEM AUTO-RESUME: The async delegated research you launched in your previous turn is now complete. " +
+            "Below are the verbatim results from each sub-agent. " +
+            "Synthesize them into a single clear final reply for the user — answer their original question directly, " +
+            "cite key findings, and do NOT delegate again. " +
+            "Reply in the same language the user originally used.]\n\n" +
+            blocks;
+
+          const platform = (task.platform as Platform | null) ?? "api";
+          const result = await this.runPrompt(
+            synthetic,
+            platform,
+            undefined,
+            undefined,
+            task.chatId ?? undefined,
+          );
+          if ("error" in result) {
+            console.warn(`[delegateResume] inference failed: ${result.error}`);
+            await this.#deliverToOrigin(
+              task.platform,
+              task.chatId,
+              `(Auto-resume failed: ${result.error})`,
+            );
+            break;
+          }
+          await this.#deliverToOrigin(task.platform, task.chatId, result.text);
           break;
         }
         default:
@@ -1913,8 +2114,10 @@ export class ClopinetteAgent extends AIChatAgent<Env, AgentState> {
     )`;
 
     // Async delegation tracking — rows created by delegate-tool when a workflow starts,
-    // updated by onDelegateComplete RPC callback. Results are injected as a system message
-    // at the next parent turn (hermes notify_on_complete pattern).
+    // updated by onDelegateComplete RPC callback. When the LAST queued/running delegate
+    // for a session completes, an auto-resume background task is scheduled so the parent
+    // LLM synthesizes the results and pushes a real reply via the originating platform.
+    // platform + chat_id are captured at INSERT time so the resume knows where to deliver.
     this.sql`CREATE TABLE IF NOT EXISTS pending_delegates (
       id TEXT PRIMARY KEY,
       session_id TEXT NOT NULL,
@@ -1926,10 +2129,31 @@ export class ClopinetteAgent extends AIChatAgent<Env, AgentState> {
       tokens_in INTEGER NOT NULL DEFAULT 0,
       tokens_out INTEGER NOT NULL DEFAULT 0,
       duration_seconds INTEGER NOT NULL DEFAULT 0,
+      platform TEXT,
+      chat_id TEXT,
       created_at TEXT DEFAULT (datetime('now')),
       completed_at TEXT
     )`;
+    // Backfill columns for DOs created before the auto-resume migration
+    try { this.sql`ALTER TABLE pending_delegates ADD COLUMN platform TEXT`; } catch { /* exists */ }
+    try { this.sql`ALTER TABLE pending_delegates ADD COLUMN chat_id TEXT`; } catch { /* exists */ }
     this.sql`CREATE INDEX IF NOT EXISTS idx_pending_delegates_session ON pending_delegates(session_id, status)`;
+
+    // One-time cleanup: purge stale `_delegate_resumed:*` sentinels left over from
+    // the previous auto-resume design. The new design uses `pending_delegates.completed_at`
+    // as the dedup marker, so the sentinels are no longer needed and were just polluting
+    // agent_config (visible in the dashboard's "Configured keys" list).
+    this.sql`DELETE FROM agent_config WHERE key LIKE '_delegate_resumed:%'`;
+
+    // Durable monthly token counter — survives /reset and /wipe (which both blow
+    // away `sessions.total_tokens`). Decoupled from the sessions table so the
+    // dashboard's "Tokens this month" stays accurate even after a wipe.
+    // PRIMARY KEY on month → atomic UPSERT prevents lost increments under concurrency.
+    this.sql`CREATE TABLE IF NOT EXISTS monthly_tokens (
+      month TEXT PRIMARY KEY,
+      total INTEGER NOT NULL DEFAULT 0,
+      updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+    )`;
 
     // Platform message ID for ✍️ reaction-to-note lookup (Telegram, WhatsApp, etc.)
     try { this.sql`ALTER TABLE session_messages ADD COLUMN platform_msg_id INTEGER`; } catch { /* already exists */ }

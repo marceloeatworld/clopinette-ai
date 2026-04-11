@@ -51,7 +51,7 @@ export interface EvolutionContext {
   apiUrl: string;
   apiKey: string;
   instanceName: string;
-  runPrompt: (text: string, media?: MediaAsset[], onToolProgress?: (toolName: string, preview: string) => void) => Promise<{ text: string; mediaDelivery?: MediaDelivery[] } | { error: string }>;
+  runPrompt: (text: string, media?: MediaAsset[], onToolProgress?: (toolName: string, preview: string) => void, chatId?: string) => Promise<{ text: string; mediaDelivery?: MediaDelivery[] } | { error: string }>;
   r2Memories: R2Bucket;
   onCacheInvalidate?: () => void;
 }
@@ -77,7 +77,7 @@ export async function handleEvolutionUpdate(
   const msg = payload.data.message;
   if (!msg) return new Response("ok");
 
-  const text = msg.conversation
+  let text = msg.conversation
     ?? msg.extendedTextMessage?.text
     ?? msg.imageMessage?.caption
     ?? msg.documentMessage?.caption
@@ -96,9 +96,12 @@ export async function handleEvolutionUpdate(
       r2Skills: ctx.env.SKILLS,
       onCacheInvalidate: ctx.onCacheInvalidate,
     });
-    if (sharedResult) {
+    if (sharedResult?.handled === true) {
       await sendEvolutionMessage(ctx.apiUrl, ctx.apiKey, ctx.instanceName, remoteJid, sharedResult.text);
       return new Response("ok");
+    }
+    if (sharedResult?.handled === false) {
+      text = sharedResult.rewriteAs;
     }
   }
 
@@ -152,7 +155,7 @@ export async function handleEvolutionUpdate(
 
     if (!prompt) return new Response("ok");
 
-    const result = await ctx.runPrompt(prompt, mediaAssets.length > 0 ? mediaAssets : undefined);
+    const result = await ctx.runPrompt(prompt, mediaAssets.length > 0 ? mediaAssets : undefined, undefined, remoteJid);
 
     if ("error" in result) {
       await sendEvolutionMessage(ctx.apiUrl, ctx.apiKey, ctx.instanceName, remoteJid, `Error: ${result.error}`);

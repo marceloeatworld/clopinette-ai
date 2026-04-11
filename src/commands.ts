@@ -27,10 +27,23 @@ export interface CommandResult {
   handled: true;
 }
 
+/**
+ * Rewrite variant — the command is recognized but instead of returning text,
+ * it asks the caller to run the pipeline with a rewritten userText. Used by
+ * /research and similar "mode-switch" commands that craft a structured prompt
+ * for the LLM while keeping the rest of the pipeline (tools, memory, BYOK) intact.
+ */
+export interface CommandRewrite {
+  handled: false;
+  rewriteAs: string;
+}
+
+export type CommandReturn = CommandResult | CommandRewrite | null;
+
 export async function handleCommand(
   text: string,
   ctx: CommandContext
-): Promise<CommandResult | null> {
+): Promise<CommandReturn> {
   const trimmed = text.trim();
   if (!trimmed.startsWith("/")) return null;
 
@@ -175,13 +188,15 @@ export async function handleCommand(
       // Require confirmation: /wipe CONFIRM
       if (arg !== "CONFIRM") {
         return {
-          text: "**This will permanently delete ALL your data:**\n" +
+          text: "**This will permanently delete:**\n" +
             "- Memory (MEMORY.md + USER.md)\n" +
-            "- All conversation sessions\n" +
-            "- All skills\n" +
-            "- All todos\n" +
-            "- All uploaded files (R2)\n" +
-            "- Document context\n\n" +
+            "- All conversation sessions and history\n" +
+            "- All skills, todos, notes, calendar events\n" +
+            "- All uploaded documents and generated media (R2)\n" +
+            "- Document context + pending delegated research\n\n" +
+            "**Preserved (so you don't have to re-setup):**\n" +
+            "- Your BYOK provider + API key + model selection\n" +
+            "- Your auxiliary provider config\n\n" +
             "This action **cannot be undone**.\n\n" +
             "To confirm, type: `/wipe CONFIRM`",
           handled: true,
@@ -197,6 +212,7 @@ export async function handleCommand(
       ctx.sql`DELETE FROM calendar_events`;
       ctx.sql`DELETE FROM doc_context`;
       ctx.sql`DELETE FROM hub_installed`;
+      ctx.sql`DELETE FROM pending_delegates`;
       ctx.sql`DELETE FROM agent_config WHERE key = '_turn_count'`;
       // Clear personality preset and reset soul to default
       ctx.sql`DELETE FROM agent_config WHERE key = 'personality'`;
@@ -206,22 +222,27 @@ export async function handleCommand(
       ctx.sql`DELETE FROM cf_ai_chat_agent_messages`;
       ctx.onCacheInvalidate?.();
 
-      // R2 wipe (docs, audio, images, skills)
+      // R2 wipe (docs, audio, images, skills, spillovers).
+      // Pagination: r2.list returns max 1000 keys per call. Loop until !truncated
+      // so users with thousands of files don't end up with stragglers.
       const safeId = ctx.userId.replace(/[^a-zA-Z0-9_-]/g, "");
-      if (ctx.r2Memories) {
-        const listed = await ctx.r2Memories.list({ prefix: `${safeId}/` });
-        if (listed.objects.length > 0) {
-          await ctx.r2Memories.delete(listed.objects.map(o => o.key));
-        }
-      }
-      if (ctx.r2Skills) {
-        const listed = await ctx.r2Skills.list({ prefix: `${safeId}/` });
-        if (listed.objects.length > 0) {
-          await ctx.r2Skills.delete(listed.objects.map(o => o.key));
-        }
-      }
+      const purgeR2 = async (bucket: R2Bucket): Promise<void> => {
+        let cursor: string | undefined;
+        do {
+          const listed = await bucket.list({ prefix: `${safeId}/`, cursor, limit: 1000 });
+          if (listed.objects.length > 0) {
+            await bucket.delete(listed.objects.map((o) => o.key));
+          }
+          cursor = listed.truncated ? listed.cursor : undefined;
+        } while (cursor);
+      };
+      if (ctx.r2Memories) await purgeR2(ctx.r2Memories);
+      if (ctx.r2Skills) await purgeR2(ctx.r2Skills);
 
-      return { text: "Full wipe complete. Memory, sessions, skills, todos, files, and all data have been deleted.", handled: true };
+      return {
+        text: "Full wipe complete. Memory, sessions, skills, todos, files, and pending research deleted. Your BYOK provider config was preserved.",
+        handled: true,
+      };
     }
 
     case "/skills": {
@@ -493,6 +514,29 @@ export async function handleCommand(
       return { text: `**Notes**${lines.join("\n")}`, handled: true };
     }
 
+    case "/research":
+    case "/deepsearch": {
+      // Deep research mode: rewrite the user prompt so the LLM is strongly
+      // pushed toward the `delegate` tool with a multi-angle decomposition
+      // and source-diversity requirement. The auto-resume in onDelegateComplete
+      // then synthesizes the results back into a single reply.
+      if (!arg) {
+        return {
+          text: "Usage: `/research <topic>` — launches 2-3 parallel sub-agents to research the topic from different angles, then synthesizes the findings.",
+          handled: true,
+        };
+      }
+      const rewriteAs =
+        `[RESEARCH MODE] You MUST use the delegate tool to launch 2 or 3 parallel sub-agents on different angles of this topic. Each delegate goal should target a distinct angle (e.g. official sources / academic papers / recent news / NGO reports / data points). After delegating, briefly tell the user research is in progress — the auto-resume will deliver the synthesized answer when all delegates complete.\n\n` +
+        `Hard rules:\n` +
+        `- DO use delegate({ tasks: [...] }) with 2-3 distinct goals.\n` +
+        `- DO target distinct domains/sources for each goal.\n` +
+        `- Do NOT call web/docs directly first — go straight to delegate.\n` +
+        `- Do NOT answer from memory.\n\n` +
+        `Topic: ${arg}`;
+      return { handled: false, rewriteAs };
+    }
+
     case "/help":
       return {
         text: [
@@ -500,6 +544,7 @@ export async function handleCommand(
           "/status — Model, tokens, agent info",
           "/model — Show or switch the active model (`/model <provider> <id>`)",
           "/insights — Cost breakdown by model this month",
+          "/research <topic> — Deep research with parallel sub-agents",
           "/memory — Show persistent memory",
           "/soul — Show personality file",
           "/session — Session info and auto-reset config",
