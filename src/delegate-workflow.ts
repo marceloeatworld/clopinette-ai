@@ -48,6 +48,7 @@ Provide a clear, concise summary of what you found.`;
 
 interface InferenceOutcome {
   status: "success" | "error";
+  modelId: string;
   summary: string;
   toolTrace: string[];
   tokensIn: number;
@@ -63,6 +64,7 @@ export class DelegateWorkflow extends WorkflowEntrypoint<Env, DelegateWorkflowPa
     if (depth >= DELEGATE_MAX_DEPTH) {
       const outcome: InferenceOutcome = {
         status: "error",
+        modelId: "",
         summary: "Maximum delegation depth reached.",
         toolTrace: [],
         tokensIn: 0,
@@ -93,6 +95,7 @@ export class DelegateWorkflow extends WorkflowEntrypoint<Env, DelegateWorkflowPa
   async #runInference(goal: string, context: string | undefined, userId: string): Promise<InferenceOutcome> {
     const start = Date.now();
     const toolTrace: string[] = [];
+    let modelId = "";
 
     try {
       // Fetch the parent user's inference config + plan via RPC. The DO holds
@@ -106,12 +109,14 @@ export class DelegateWorkflow extends WorkflowEntrypoint<Env, DelegateWorkflowPa
       let auxiliary;
       try {
         const { config, plan } = await stub.getInferenceConfigForDelegation();
+        modelId = config.model;
         model = createModel(config, this.env, undefined, { plan });
         auxiliary = createAuxiliaryModel(config, this.env, plan);
       } catch (err) {
         if (err instanceof PlanViolationError) {
           return {
             status: "error",
+            modelId,
             summary: `Delegation skipped — ${err.message}`,
             toolTrace,
             tokensIn: 0,
@@ -200,6 +205,7 @@ export class DelegateWorkflow extends WorkflowEntrypoint<Env, DelegateWorkflowPa
 
       return {
         status: "success",
+        modelId,
         summary: result.text || "No response generated.",
         toolTrace,
         tokensIn: result.usage?.inputTokens ?? 0,
@@ -209,6 +215,7 @@ export class DelegateWorkflow extends WorkflowEntrypoint<Env, DelegateWorkflowPa
     } catch (err) {
       return {
         status: "error",
+        modelId,
         summary: `Delegation failed: ${err instanceof Error ? err.message : String(err)}`,
         toolTrace,
         tokensIn: 0,
@@ -237,6 +244,7 @@ export class DelegateWorkflow extends WorkflowEntrypoint<Env, DelegateWorkflowPa
           id,
           sessionId,
           status: outcome.status,
+          modelId: outcome.modelId,
           summary: outcome.summary,
           toolTrace: outcome.toolTrace,
           durationSeconds: outcome.durationSeconds,

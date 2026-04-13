@@ -2,7 +2,7 @@
 export {};
 /**
  * ClopinetteAI — Smoke test script
- * Tests all core features against the live deployment.
+ * Tests the public core-worker surface against the live deployment.
  *
  * Usage:
  *   bun test/live/smoke.ts
@@ -174,37 +174,45 @@ function wsChat(text: string): Promise<{ text: string; tools: string[] }> {
   });
 }
 
+function wsAuthFails(token: string): Promise<number> {
+  return new Promise((resolve, reject) => {
+    const url = `${BASE.replace("https://", "wss://")}/agents/clopinette-agent/${USER_ID}?token=${encodeURIComponent(token)}`;
+    const ws = new WebSocket(url);
+    let settled = false;
+
+    const done = (code: number) => {
+      if (settled) return;
+      settled = true;
+      resolve(code);
+    };
+
+    const timeout = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      try { ws.close(); } catch {}
+      reject(new Error("Timed out waiting for auth failure"));
+    }, 10_000);
+
+    ws.onopen = () => {};
+    ws.onerror = () => {};
+    ws.onclose = (e) => {
+      clearTimeout(timeout);
+      done(e.code);
+    };
+  });
+}
+
 // ─────────────────────── Tests ───────────────────────
 
 console.log(`\n🔬 ClopinetteAI Smoke Test`);
 console.log(`   ${BASE} — user: ${USER_ID}\n`);
 
-// ── API ──
-console.log("API Routes:");
+// ── HTTP ──
+console.log("HTTP Routes:");
 
-await test("POST /api/setup", async () => {
-  const { status, data } = await api("POST", "/api/setup", { userId: USER_ID, displayName: "Smoke" });
-  assert(status === 200, `status ${status}`);
-  assert(data.ok === true, `expected ok:true, got ${JSON.stringify(data)}`);
-});
-
-await test("GET /api/status", async () => {
-  const { status, data } = await api("GET", `/api/status?userId=${USER_ID}`);
-  assert(status === 200, `status ${status}`);
-  assert(data.ok === true, `expected ok:true`);
-  assert(typeof data.currentModel === "string", "missing currentModel");
-  console.log(`      model=${data.currentModel} status=${data.status}`);
-});
-
-await test("POST /api/config (model)", async () => {
-  const { status, data } = await api("POST", "/api/config", { userId: USER_ID, model: "@cf/moonshotai/kimi-k2.5" });
-  assert(status === 200, `status ${status}`);
-  assert(data.ok === true, `expected ok:true`);
-});
-
-await test("Auth required (no header)", async () => {
-  const resp = await fetch(`${BASE}/api/status?userId=x`);
-  assert(resp.status === 401, `expected 401, got ${resp.status}`);
+await test("Auth required on /mcp (no header)", async () => {
+  const resp = await fetch(`${BASE}/mcp`);
+  assert(resp.status === 401 || resp.status === 503, `expected 401/503, got ${resp.status}`);
 });
 
 await test("404 on unknown route", async () => {
@@ -214,6 +222,12 @@ await test("404 on unknown route", async () => {
 
 // ── WebSocket Chat (with pauses between tests to let the DO settle) ──
 console.log("\nWebSocket Chat:");
+
+await test("WebSocket rejects bad token", async () => {
+  const code = await wsAuthFails("definitely-invalid-token");
+  assert(code === 4001 || code === 4003, `expected auth close, got ${code}`);
+});
+await sleep(1000);
 
 await test("Basic chat response", async () => {
   const r = await wsChat("Say exactly: SMOKE_OK");

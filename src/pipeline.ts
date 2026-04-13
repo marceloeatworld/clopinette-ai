@@ -251,6 +251,28 @@ export interface SpillContext {
   sessionId: string;
 }
 
+function enqueueUsageReport(
+  env: Env,
+  message: {
+    userId: string;
+    tokensIn: number;
+    tokensOut: number;
+    model: string;
+    sessionId: string;
+    timestamp: number;
+  },
+  waitUntil?: (promise: Promise<unknown>) => void,
+): void {
+  const sendPromise = env.USAGE_QUEUE.send(message).catch((err) => {
+    console.warn("Failed to enqueue usage report:", err);
+  });
+  if (waitUntil) {
+    waitUntil(sendPromise);
+  } else {
+    void sendPromise;
+  }
+}
+
 function sanitizeForPath(id: string): string {
   return id.replace(/[^a-zA-Z0-9_-]/g, "");
 }
@@ -597,20 +619,22 @@ async function runPipelineInner(
 
   // Step 5: Honcho context (opt-in)
   let honchoContext: string | null = null;
-  const honchoRows = ctx.sql<{ key: string; value: string }>`
-    SELECT key, value FROM agent_config WHERE key IN ('honcho_base_url','honcho_api_key','honcho_app_id')
-  `;
-  if (honchoRows.length === 3) {
-    const hMap = new Map(honchoRows.map((r) => [r.key, r.value]));
-    try {
-      const hCtx = await getHonchoContext(
-        { baseUrl: hMap.get("honcho_base_url")!, apiKey: hMap.get("honcho_api_key")!, appId: hMap.get("honcho_app_id")! },
-        ctx.userId,
-        ctx.sessionId,
-        ctx.userText
-      );
-      honchoContext = hCtx?.content ?? null;
-    } catch { /* non-fatal */ }
+  if (!ctx.cachedSystemPrompt) {
+    const honchoRows = ctx.sql<{ key: string; value: string }>`
+      SELECT key, value FROM agent_config WHERE key IN ('honcho_base_url','honcho_api_key','honcho_app_id')
+    `;
+    if (honchoRows.length === 3) {
+      const hMap = new Map(honchoRows.map((r) => [r.key, r.value]));
+      try {
+        const hCtx = await getHonchoContext(
+          { baseUrl: hMap.get("honcho_base_url")!, apiKey: hMap.get("honcho_api_key")!, appId: hMap.get("honcho_app_id")! },
+          ctx.userId,
+          ctx.sessionId,
+          ctx.userText
+        );
+        honchoContext = hCtx?.content ?? null;
+      } catch { /* non-fatal */ }
+    }
   }
 
   // Step 6: Build system prompt (cached per session for prefix caching — 83% token savings)
@@ -646,7 +670,7 @@ async function runPipelineInner(
       didCompress = true;
       trackAuxiliaryUsage(
         ctx.sql, ctx.sessionId, compression.auxTokensIn, compression.auxTokensOut,
-        auxiliary.modelId, ctx.env, ctx.userId,
+        auxiliary.modelId, ctx.env, ctx.userId, ctx.waitUntil,
       );
     }
   }
@@ -666,6 +690,7 @@ async function runPipelineInner(
     userId: ctx.userId,
     sessionId: ctx.sessionId,
     env: ctx.env,
+    waitUntil: ctx.waitUntil,
     queueTask: ctx.queueTask,
     cfAccountId: ctx.env.CF_ACCOUNT_ID,
     cfBrowserToken: ctx.env.CF_BROWSER_TOKEN,
@@ -700,7 +725,7 @@ async function runPipelineInner(
           const transcribed = await transcribeAudio(asset, ctx.env.MEMORIES, ctx.env.AI);
           if (transcribed.audioBytes) {
             const equivTokens = Math.ceil(transcribed.audioBytes / 1000) * WHISPER_TOKENS_PER_KB;
-            trackAuxiliaryUsage(ctx.sql, ctx.sessionId, equivTokens, 0, "@cf/openai/whisper-large-v3-turbo", ctx.env, ctx.userId);
+            trackAuxiliaryUsage(ctx.sql, ctx.sessionId, equivTokens, 0, "@cf/openai/whisper-large-v3-turbo", ctx.env, ctx.userId, ctx.waitUntil);
           }
           if (transcribed.transcription) {
             // Save .transcript.md sidecar + update context metadata on original
@@ -984,7 +1009,7 @@ async function runPipelineInner(
         if (summaryTokensIn > 0 || summaryTokensOut > 0) {
           trackAuxiliaryUsage(
             ctx.sql, ctx.sessionId, summaryTokensIn, summaryTokensOut,
-            config.model, ctx.env, ctx.userId,
+            config.model, ctx.env, ctx.userId, ctx.waitUntil,
           );
         }
       } catch (err) {
@@ -1148,14 +1173,15 @@ export function trackAuxiliaryUsage(
   sql: SqlFn, sessionId: string,
   tokensIn: number, tokensOut: number,
   model: string, env: Env, userId: string,
+  waitUntil?: (promise: Promise<unknown>) => void,
 ): void {
   const tokens = tokensIn + tokensOut;
   if (tokens <= 0) return;
   sql`UPDATE sessions SET total_tokens = total_tokens + ${tokens} WHERE id = ${sessionId}`;
   incrementMonthlyTokens(sql, tokens);
-  env.USAGE_QUEUE.send({
+  enqueueUsageReport(env, {
     userId, tokensIn, tokensOut, model, sessionId, timestamp: Date.now(),
-  });
+  }, waitUntil);
 }
 
 // ───────────────────────── Post-inference (step 10) ─────────────────────────
@@ -1198,14 +1224,14 @@ function afterInference(
     incrementMonthlyTokens(ctx.sql, tokens);
 
     // Gateway usage reporting via Cloudflare Queue (retry-safe, DLQ-backed)
-    ctx.env.USAGE_QUEUE.send({
+    enqueueUsageReport(ctx.env, {
       userId: ctx.userId,
       tokensIn: usage.inputTokens ?? 0,
       tokensOut: usage.outputTokens ?? 0,
       model: config.model,
       sessionId: ctx.sessionId,
       timestamp: Date.now(),
-    });
+    }, ctx.waitUntil);
   } else {
     // No usage info but still touch the timestamp
     ctx.sql`UPDATE sessions SET updated_at = datetime('now') WHERE id = ${ctx.sessionId}`;
@@ -1240,12 +1266,12 @@ function afterInference(
           options: { reviewMemory: true, reviewSkills: true },
         });
       } else {
-        runSelfLearningReview(
+        const reviewPromise = runSelfLearningReview(
           summary, ctx.sql, auxiliary.model, ctx.env.MEMORIES, ctx.env.SKILLS, ctx.userId,
           { reviewMemory: true, reviewSkills: true }
         ).then((r) => {
           if (r.tokensIn > 0 || r.tokensOut > 0) {
-            trackAuxiliaryUsage(ctx.sql, ctx.sessionId, r.tokensIn, r.tokensOut, auxiliary.modelId, ctx.env, ctx.userId);
+            trackAuxiliaryUsage(ctx.sql, ctx.sessionId, r.tokensIn, r.tokensOut, auxiliary.modelId, ctx.env, ctx.userId, ctx.waitUntil);
           }
           if (r.memoryActions > 0 || r.skillActions > 0) {
             console.log(`Self-learning: ${r.memoryActions} memory, ${r.skillActions} skill updates`);
@@ -1253,6 +1279,8 @@ function afterInference(
         }).catch((err) => {
           console.warn("Self-learning review failed:", err);
         });
+        if (ctx.waitUntil) ctx.waitUntil(reviewPromise);
+        else void reviewPromise;
       }
     }
   }

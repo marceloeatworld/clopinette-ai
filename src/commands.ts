@@ -2,6 +2,7 @@ import type { SqlFn } from "./config/sql.js";
 import { searchSessions } from "./memory/session-search.js";
 import { PERSONALITIES, PERSONALITY_NAMES } from "./config/personalities.js";
 import { DEFAULT_SOUL_MD, DEFAULT_MODEL, WORKERS_AI_MODELS, isWorkersAiModel } from "./config/constants.js";
+import { readMonthlyUsage } from "./enterprise/budget.js";
 
 /**
  * Shared slash commands — work on ALL gateways (Telegram, WebSocket, Discord, Slack, API).
@@ -84,12 +85,7 @@ export async function handleCommand(
         || DEFAULT_MODEL;
       const name = configMap.get("display_name") || "not set";
 
-      const now = new Date();
-      const monthStart = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-01`;
-      const usageRows = ctx.sql<{ total: number }>`
-        SELECT COALESCE(SUM(total_tokens), 0) as total FROM sessions WHERE started_at >= ${monthStart}
-      `;
-      const tokens = usageRows[0]?.total ?? 0;
+      const tokens = readMonthlyUsage(ctx.sql);
 
       const skillRows = ctx.sql<{ count: number }>`SELECT COUNT(*) as count FROM skills`;
       const sessionRows = ctx.sql<{ count: number }>`SELECT COUNT(*) as count FROM sessions`;

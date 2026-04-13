@@ -4,13 +4,16 @@ export const KIMI_MODEL = "@cf/moonshotai/kimi-k2.5";
 export const GEMMA_MODEL = "@cf/google/gemma-4-26b-a4b-it";
 
 /**
- * DEFAULT_MODEL is used for **internal/auxiliary** work: compression, self-learning,
- * delegate sub-agents, page summarization, browser AI snapshots. We keep this on Gemma
- * because it's smaller, cheaper and fast enough for auxiliary tasks. The user-facing
- * conversation model is whatever they pick via /model — Kimi or Gemma on free plans,
- * any BYOK provider on Pro/BYOK.
+ * DEFAULT_MODEL is the user-facing Workers AI fallback when no explicit model is
+ * configured. Trial/pro users start on Kimi.
  */
-export const DEFAULT_MODEL = GEMMA_MODEL;
+export const DEFAULT_MODEL = KIMI_MODEL;
+
+/**
+ * AUXILIARY_MODEL is reserved for internal/background work: compression,
+ * self-learning, browser summaries, and simple-turn routing. We keep that on
+ * Gemma because it is smaller and cheaper than the primary default.
+ */
 export const AUXILIARY_MODEL = GEMMA_MODEL;
 
 /** Workers AI models available to trial + pro plans as user-facing chat models. */

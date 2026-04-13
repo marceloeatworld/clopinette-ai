@@ -2,8 +2,8 @@
  * Layer 5: Honcho — optional external context API.
  *
  * Honcho provides user modeling and context from an external service.
- * If configured, it's called on turn 1 (injected in system prompt)
- * and on subsequent turns (injected in user message).
+ * The current pipeline injects it when rebuilding the system prompt, so callers
+ * should avoid fetching it on turns that reuse the cached prompt unchanged.
  *
  * API: https://docs.honcho.dev
  */

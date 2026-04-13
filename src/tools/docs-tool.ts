@@ -220,7 +220,10 @@ async function keywordSearch(ctx: ToolContext, query: string, limit: number) {
     context: contextMap.get(obj.key) ?? obj.customMetadata?.context,
   }));
 
-  const scored = await Promise.all(files.map(async (file) => {
+  // Read documents sequentially to avoid buffering many large R2 objects in
+  // memory at once inside a Worker.
+  const scored: Array<{ document: string; snippet: string; relevance: number; type: string } | null> = [];
+  for (const file of files) {
     let score = 0;
     let snippet = "";
     const nameLower = file.name.toLowerCase();
@@ -267,8 +270,8 @@ async function keywordSearch(ctx: ToolContext, query: string, limit: number) {
       }
     }
 
-    return score > 0 ? { document: file.name, snippet, relevance: score, type: file.mime ?? "unknown" } : null;
-  }));
+    scored.push(score > 0 ? { document: file.name, snippet, relevance: score, type: file.mime ?? "unknown" } : null);
+  }
 
   const matches = scored.filter((m): m is NonNullable<typeof m> => m !== null);
   matches.sort((a, b) => b.relevance - a.relevance);

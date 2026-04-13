@@ -69,7 +69,7 @@ const PRICING: Record<string, ModelPricing> = {
   "mistral-small-latest": { inputPer1M: 0.20, outputPer1M: 0.60 },
 
   // ── Internal / synthetic rows produced by the pipeline ────────────────
-  "delegate-workflow": { inputPer1M: 0.10, outputPer1M: 0.40 }, // delegates run on DEFAULT_MODEL (Gemma)
+  "delegate-workflow": { inputPer1M: 0.50, outputPer1M: 2.00 }, // legacy synthetic row from older delegate tracking
 };
 
 /** Look up pricing for a model id, with graceful fallback. */

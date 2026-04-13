@@ -38,6 +38,7 @@ export interface ToolContext {
   userId: string;
   sessionId: string;
   env: { GATEWAY_URL?: string; GATEWAY_INTERNAL_KEY?: string; WS_SIGNING_SECRET: string };
+  waitUntil?: (promise: Promise<unknown>) => void;
   queueTask?: (task: BackgroundTask) => void;
   cfAccountId: string;
   cfBrowserToken?: string;
@@ -56,7 +57,7 @@ function createUsageTracker(ctx: ToolContext) {
   return (tokensIn: number, tokensOut: number, model: string) => {
     trackAuxiliaryUsage(
       ctx.sql, ctx.sessionId, tokensIn, tokensOut,
-      model, ctx.env as Env, ctx.userId,
+      model, ctx.env as Env, ctx.userId, ctx.waitUntil,
     );
   };
 }

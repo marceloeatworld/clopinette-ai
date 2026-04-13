@@ -1335,13 +1335,14 @@ export class ClopinetteAgent extends AIChatAgent<Env, AgentState> {
     id: string;
     sessionId: string;
     status: "success" | "error";
+    modelId?: string;
     summary: string;
     toolTrace: string[];
     durationSeconds: number;
     tokensIn: number;
     tokensOut: number;
   }): Promise<{ ok: true }> {
-    const { id, sessionId, status, summary, toolTrace, durationSeconds, tokensIn, tokensOut } = result;
+    const { id, sessionId, status, modelId, summary, toolTrace, durationSeconds, tokensIn, tokensOut } = result;
     const sqlBound = this.sql.bind(this);
 
     let scheduleResume: { platform: string | null; chatId: string | null } | null = null;
@@ -1383,7 +1384,8 @@ export class ClopinetteAgent extends AIChatAgent<Env, AgentState> {
         const { trackAuxiliaryUsage } = await import("./pipeline.js");
         trackAuxiliaryUsage(
           sqlBound, sessionId, tokensIn, tokensOut,
-          "delegate-workflow", this.env, this.#userId,
+          modelId || "delegate-workflow", this.env, this.#userId,
+          (promise) => this.ctx.waitUntil(promise),
         );
       }
 
@@ -1727,6 +1729,7 @@ export class ClopinetteAgent extends AIChatAgent<Env, AgentState> {
             trackAuxiliaryUsage(
               sqlBound, task.sessionId, r.tokensIn, r.tokensOut,
               auxiliary.modelId, this.env, task.userId,
+              (promise) => this.ctx.waitUntil(promise),
             );
           }
           if (r.memoryActions > 0 || r.skillActions > 0) {
