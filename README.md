@@ -1,6 +1,6 @@
 # ClopinetteAI
 
-Cloudflare-native AI agent with persistent memory, 12 tools, multimodal I/O, and Telegram / WhatsApp / Discord bots out of the box. One Durable Object per user, serverless, BYOK-ready.
+Cloudflare-native AI agent with persistent memory, a built-in skills hub, multimodal I/O, and Telegram / WhatsApp / Discord bots out of the box. One Durable Object per user, serverless, BYOK-ready.
 
 > *Clopinette* = French for "next to nothing". An AI agent that costs clopinettes to run.
 
@@ -19,10 +19,10 @@ Inspired by [hermes-agent](https://github.com/NousResearch/hermes-agent) (Nous R
                 (one per user, SQLite + R2)
                               │
                               ▼
-         runPipeline() ──► LLM  +  12 tools  +  5 memory layers
+         runPipeline() ──► LLM  +  tool layer  +  5 memory layers
 ```
 
-Every user gets an isolated Durable Object with its own SQLite, its own `MEMORY.md` / `USER.md`, its own skills. The agent streams over WebSocket on the web UI and replies to Telegram / WhatsApp / Discord via webhooks. Telegram and WhatsApp can be linked to a web account with `/link` so the bot shares memory across channels.
+Every user gets an isolated Durable Object with its own SQLite, its own `MEMORY.md` / `USER.md`, and its own skills. The agent streams over WebSocket on the web UI and replies to Telegram / WhatsApp / Discord via webhooks. Telegram, WhatsApp, and Discord can be linked to a web account with `/link` so the bot shares memory across channels.
 
 Supporting Cloudflare services (used transparently):
 - **Queues** — usage reports, retry-safe with DLQ
@@ -33,19 +33,21 @@ Supporting Cloudflare services (used transparently):
 ## Features
 
 - **Chat** — streaming WebSocket with Markdown, images, voice, drag-and-drop upload
-- **12 tools** — web search, docs RAG, memory, history, skills, notes, calendar, todo, image generation, text-to-speech, browser (Playwright), async delegation
+- **Tool-driven runtime** — web, docs, memory, history, skills, notes, calendar, todo, image, tts, clarify, with optional browser, delegation, and codemode
 - **5-layer memory** — MEMORY.md / USER.md, hybrid FTS5+Vectorize session search, memory flush, skills index, optional Honcho
 - **Multi-platform** — Telegram, WhatsApp (Meta Cloud API + self-hosted Evolution/Baileys), Discord (slash commands + DM bridge), MCP
 - **14 personality presets** — helpful, concise, technical, kawaii, pirate, shakespeare, noir, uwu, etc. (`/personality`)
+- **Skills Hub** — install skills from the built-in catalog or trusted GitHub repos like Hermes, Cloudflare, MiniMax, and gstack
+- **Hub hardening** — scans imported skills for prompt-injection / exfiltration structure before install, while preserving trusted security and red-team bundles
 - **BYOK** — bring your own key across 12 providers (OpenAI, Anthropic, Groq, xAI, Mistral, DeepSeek, …) via the Cloudflare AI Gateway
 - **Cross-provider auxiliary** — e.g. primary OpenAI + auxiliary Anthropic for the fast-path / compression
 - **Self-learning** — the agent updates its own memory after N turns
-- **Async delegation with auto-resume** — sub-agents run in parallel via Cloudflare Workflows. When the last delegate finishes, the agent automatically synthesizes their results and pushes the final reply via the originating gateway (web / Telegram / WhatsApp / Discord). No need to send a follow-up message.
+- **Async delegation with auto-resume** — web-only research sub-agents run in parallel via Cloudflare Workflows. When the last delegate finishes, the agent automatically synthesizes their results and pushes the final reply via the originating gateway (web / Telegram / WhatsApp / Discord). No need to send a follow-up message.
 - **Multimodal** — vision (images), Whisper (voice), PDF / DOCX / XLSX / text extraction
 
 ## Tools
 
-The LLM sees 12 tools + `codemode` sandbox for orchestration:
+Primary tools available to the agent:
 
 | Tool | What it does |
 |---|---|
@@ -53,7 +55,7 @@ The LLM sees 12 tools + `codemode` sandbox for orchestration:
 | `docs` | RAG search + Q&A over user-uploaded documents (AutoRAG) |
 | `history` | Hybrid keyword + semantic search across past conversations |
 | `memory` | Read / write persistent `MEMORY.md` and `USER.md` |
-| `skills` | Load, create, edit `.md` skill files (reusable prompts) |
+| `skills` | Load, create, edit, and inspect reusable `SKILL.md` files with compact indexing and platform filters |
 | `notes` | Personal notes with URL enrichment |
 | `calendar` | Events + one-shot reminders delivered on all platforms |
 | `todo` | Task list |
@@ -61,9 +63,15 @@ The LLM sees 12 tools + `codemode` sandbox for orchestration:
 | `tts` | Text-to-speech (12 voices, Deepgram Aura) |
 | `clarify` | Ask the user a structured question mid-execution |
 | `browser` | Playwright MCP (navigate, click, type, snapshot, diagnostics, human handoff) — conditional |
-| `delegate` | Run parallel research sub-agents in the background (web search + one URL read) — conditional |
+| `delegate` | Run parallel web-only research sub-agents in the background — conditional |
 
-With codemode active (when the `LOADER` binding is set), the LLM writes JavaScript that orchestrates multiple tool calls in one step — up to 5x more token-efficient.
+With codemode active (when the `LOADER` binding is set), the LLM writes JavaScript that orchestrates internal state tools in one step instead of spending tokens on repetitive tool chatter.
+
+### Skills Hub
+
+- Browse installable skills from the built-in catalog or trusted GitHub repos (`Hermes`, `Cloudflare`, `MiniMax`, `gstack`).
+- Imported skills can carry support files such as `references/`, `templates/`, and `scripts/` when they are text-based.
+- Hub installs are scanned for structural prompt-injection, secret-exfiltration, and dangerous URI patterns before they are written to user storage.
 
 ### Browser Run observability
 
@@ -202,10 +210,13 @@ Slash commands (`/ask`, `/status`, `/memory`, etc.) work immediately. The bridge
 ### Optional secrets
 
 ```bash
-# Web search backends (automatic fallback: SearXNG → Brave → Browser Rendering)
+# Web search backends (automatic fallback: SearXNG → Brave → Browser Run)
 wrangler secret put SEARXNG_URL          # self-hosted SearXNG URL
 wrangler secret put BRAVE_API_KEY        # free tier: 2000 queries/month
 wrangler secret put CF_BROWSER_TOKEN     # last resort + read/extract/crawl
+
+# Optional GitHub token for Hub indexing / install rate limits
+wrangler secret put GITHUB_TOKEN
 
 # Evolution API (self-hosted WhatsApp via Baileys)
 wrangler secret put EVOLUTION_API_URL
@@ -218,7 +229,7 @@ wrangler secret put EVOLUTION_API_KEY
 src/
   index.ts             Hono router — webhooks + MCP + platform setup routes
   agent.ts             ClopinetteAgent DO — sessions, RPC methods, live state
-  pipeline.ts          Inference pipeline (fast path + full 10 steps)
+  pipeline.ts          Inference pipeline
   prompt-builder.ts    10-block system prompt (cached per session)
   compression.ts       Structured context compression + memory flush
   commands.ts          Platform-agnostic slash commands
@@ -228,11 +239,11 @@ src/
   config/              Types, constants, personalities
   media/               Vision, Whisper, PDF/DOCX/XLSX
   memory/              Prompt memory, hybrid FTS5+Vectorize search, skills, self-learning
-  tools/               12 tool implementations + registry
-  hub/                 Skills catalog + GitHub + URL sources
+  tools/               Tool implementations + registry
+  hub/                 Skills catalog + trusted GitHub / URL sources + install security
   inference/           Per-provider config + smart routing + Anthropic cache
   enterprise/          Auth, audit, budget
-  gateway/              Telegram / WhatsApp / Evolution / Slack / Discord adapters
+  gateway/             Telegram / WhatsApp / Evolution / Discord adapters + Slack stub
 
 workers/outbound/       SSRF-safe fetch proxy for codemode sandbox
 workers/discord-bridge/ Discord Gateway bridge (Bun + Docker)
@@ -249,7 +260,7 @@ BASE_URL=https://your-worker.workers.dev API_KEY=xxx bun test/live/smoke.ts
 
 ## Tech stack
 
-Cloudflare Workers, Durable Objects, Workflows, Queues, Vectorize, Workers AI, AI Gateway, KV, R2, Browser Rendering, AutoRAG. TypeScript + [Hono](https://hono.dev) + [Agents SDK](https://github.com/cloudflare/agents) + [AI SDK v6](https://ai-sdk.dev).
+Cloudflare Workers, Durable Objects, Workflows, Queues, Vectorize, Workers AI, AI Gateway, KV, R2, Browser Run, AutoRAG. TypeScript + [Hono](https://hono.dev) + [Agents SDK](https://github.com/cloudflare/agents) + [AI SDK v6](https://ai-sdk.dev).
 
 ## License
 
