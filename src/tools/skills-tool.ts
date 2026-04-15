@@ -30,6 +30,7 @@ export function createSkillsTool(ctx: ToolContext) {
       content: z.string().optional().describe("Skill content (for create/edit)"),
       description: z.string().optional().describe("One-line description (for create/edit)"),
       triggerPattern: z.string().optional().describe("When to activate (for create/edit)"),
+      platforms: z.string().optional().describe("Allowed platforms as CSV or [list] (for create/edit)"),
       find: z.string().optional().describe("Text to find (for patch)"),
       replace: z.string().optional().describe("Replacement text (for patch)"),
     }),
@@ -41,16 +42,17 @@ export function createSkillsTool(ctx: ToolContext) {
       content?: string;
       description?: string;
       triggerPattern?: string;
+      platforms?: string;
       find?: string;
       replace?: string;
     }) => {
       switch (params.action) {
         case "list":
-          return { ok: true, skills: listSkills(ctx.sql, params.category) };
+          return { ok: true, skills: listSkills(ctx.sql, params.category, ctx.platform) };
 
         case "search":
           if (!params.query) return { ok: false, error: "query required" };
-          return { ok: true, skills: searchSkills(ctx.sql, params.query) };
+          return { ok: true, skills: searchSkills(ctx.sql, params.query, ctx.platform) };
 
         case "view":
           if (!params.name) return { ok: false, error: "name required" };
@@ -65,6 +67,7 @@ export function createSkillsTool(ctx: ToolContext) {
             category: params.category,
             description: params.description,
             triggerPattern: params.triggerPattern,
+            platforms: params.platforms,
           });
 
         case "edit":
@@ -74,6 +77,7 @@ export function createSkillsTool(ctx: ToolContext) {
             category: params.category,
             description: params.description,
             triggerPattern: params.triggerPattern,
+            platforms: params.platforms,
           });
 
         case "patch":

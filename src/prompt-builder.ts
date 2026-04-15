@@ -93,7 +93,7 @@ export async function buildSystemPrompt(ctx: PromptContext): Promise<string> {
   }
 
   // [3] Skills index — only if skills exist (saves tokens when none installed)
-  const skillsIndex = getSkillsIndex(ctx.sql);
+  const skillsIndex = getSkillsIndex(ctx.sql, ctx.platform);
   if (skillsIndex) {
     blocks.push(skillsIndex);
   }

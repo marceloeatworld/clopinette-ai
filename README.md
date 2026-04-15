@@ -61,7 +61,7 @@ The LLM sees 12 tools + `codemode` sandbox for orchestration:
 | `tts` | Text-to-speech (12 voices, Deepgram Aura) |
 | `clarify` | Ask the user a structured question mid-execution |
 | `browser` | Playwright MCP (navigate, click, type, snapshot, diagnostics, human handoff) — conditional |
-| `delegate` | Run parallel sub-agents in the background — conditional |
+| `delegate` | Run parallel research sub-agents in the background (web search + one URL read) — conditional |
 
 With codemode active (when the `LOADER` binding is set), the LLM writes JavaScript that orchestrates multiple tool calls in one step — up to 5x more token-efficient.
 
@@ -111,7 +111,7 @@ Work on every platform (web, Telegram, WhatsApp, Discord).
 | Internal / auxiliary | Gemma 4 26B — compression, self-learning, web summarization, browser snapshots |
 | BYOK | 12 providers via AI Gateway, per-provider config, cross-provider auxiliary |
 | BYOK enforcement | BYOK plan never touches Workers AI for inference — all chat, compression, self-learning, delegates run on the user's own provider |
-| Max steps | 6 parent, 3 delegate |
+| Max steps | 6 parent, 2 delegate |
 | Context compression | Structured summary at 40+ messages |
 | Prefix caching | Workers AI session affinity + cached system prompt (~83% token savings) |
 | Error recovery | 429/529 → fallback to Workers AI default for trial / pro. BYOK surfaces the original provider error (no silent Workers AI fallback). |

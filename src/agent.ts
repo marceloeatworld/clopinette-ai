@@ -1777,7 +1777,7 @@ export class ClopinetteAgent extends AIChatAgent<Env, AgentState> {
             "[SYSTEM AUTO-RESUME: The async delegated research you launched in your previous turn is now complete. " +
             "Below are the verbatim results from each sub-agent. " +
             "Synthesize them into a single clear final reply for the user — answer their original question directly, " +
-            "cite key findings, and do NOT delegate again. " +
+            "cite key findings, preserve useful source URLs when present, note contradictions or missing evidence, and do NOT delegate again. " +
             "Reply in the same language the user originally used.]\n\n" +
             blocks;
 

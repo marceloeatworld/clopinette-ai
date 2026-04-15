@@ -22,6 +22,7 @@ import type { MediaAsset } from "../config/types.js";
 import type { MediaDelivery } from "../pipeline.js";
 import { downloadAndStore } from "../media/handler.js";
 import { handleCommand } from "../commands.js";
+import { DiscordProgressController, type DiscordEditResult } from "./discord-progress.js";
 
 const DISCORD_API = "https://discord.com/api/v10";
 const MAX_LENGTH = 2000;
@@ -75,6 +76,12 @@ export interface DiscordInteraction {
 export interface DiscordBridgePayload {
   type: "MESSAGE_CREATE";
   message: DiscordMessage;
+}
+
+export interface DiscordRoutingOptions {
+  applicationId: string;
+  requireMention?: boolean;
+  freeResponseChannels?: Iterable<string>;
 }
 
 export interface DiscordContext {
@@ -307,8 +314,10 @@ export async function handleDiscordMessage(
   message: DiscordMessage,
   ctx: DiscordContext,
 ): Promise<void> {
+  if (!shouldProcessDiscordMessage(message, resolveDiscordRoutingOptions(ctx))) return;
+
   const channelId = message.channel_id;
-  let text = message.content ?? "";
+  let text = stripDiscordBotMentions(message.content ?? "", ctx.applicationId);
 
   // Handle slash commands (typed manually in DMs, e.g. "/status")
   if (text.startsWith("/")) {
@@ -356,7 +365,7 @@ export async function handleDiscordMessage(
   }
 
   // Typing indicator
-  const typingInterval = startTypingLoop(ctx.botToken, channelId);
+  const typingLoop = startTypingLoop(ctx.botToken, channelId);
 
   try {
     let prompt = text;
@@ -374,39 +383,48 @@ export async function handleDiscordMessage(
       else prompt = "I sent you a file. Please analyze it.";
     }
 
-    if (!prompt) { clearInterval(typingInterval); return; }
+    if (!prompt) {
+      typingLoop.stop();
+      return;
+    }
 
-    // Tool progress: edit a placeholder message
-    const placeholderMsgId = await sendDiscordMessage(ctx.botToken, channelId, "...");
-    const TOOL_EMOJIS: Record<string, string> = {
-      web: "🔍", memory: "🧠", history: "📜", skills: "📚", todo: "✅",
-      docs: "📄", notes: "📝", calendar: "📅", image: "🎨", tts: "🔊",
-      codemode: "⚡", browser: "🌐", clarify: "❓",
-    };
-    const progressLines: string[] = [];
+    const placeholderMsgId = await sendDiscordMessage(
+      ctx.botToken,
+      channelId,
+      DiscordProgressController.initialText(),
+    );
+    const progressController = placeholderMsgId
+      ? new DiscordProgressController({
+          editMessage: (content) => editDiscordMessage(ctx.botToken, channelId, placeholderMsgId, content),
+          pingTyping: () => triggerTyping(ctx.botToken, channelId),
+        })
+      : null;
+    progressController?.start();
     const onToolProgress = placeholderMsgId
-      ? (toolName: string, preview: string) => {
-          const emoji = TOOL_EMOJIS[toolName] ?? "⚙️";
-          const line = preview ? `${emoji} ${toolName}: "${preview}"` : `${emoji} ${toolName}...`;
-          progressLines.push(line);
-          editDiscordMessage(ctx.botToken, channelId, placeholderMsgId, progressLines.join("\n")).catch(() => {});
-        }
+      ? (toolName: string, preview: string) => progressController?.pushToolProgress(toolName, preview)
       : undefined;
 
     const result = await ctx.runPrompt(prompt, mediaAssets.length > 0 ? mediaAssets : undefined, onToolProgress, channelId);
 
-    clearInterval(typingInterval);
+    typingLoop.stop();
+    progressController?.stop();
 
     if ("error" in result) {
       if (placeholderMsgId) {
-        await editDiscordMessage(ctx.botToken, channelId, placeholderMsgId, `Error: ${result.error}`);
+        const sentMsgId = await replaceDiscordPlaceholder(ctx.botToken, channelId, placeholderMsgId, `Error: ${result.error}`);
+        if (!sentMsgId) {
+          await sendDiscordMessage(ctx.botToken, channelId, `Error: ${result.error}`);
+        }
       } else {
         await sendDiscordMessage(ctx.botToken, channelId, `Error: ${result.error}`);
       }
     } else {
       if (result.text && result.text !== "(no response)") {
         if (placeholderMsgId) {
-          await editDiscordMessage(ctx.botToken, channelId, placeholderMsgId, result.text);
+          const sentMsgId = await replaceDiscordPlaceholder(ctx.botToken, channelId, placeholderMsgId, result.text);
+          if (!sentMsgId) {
+            await sendDiscordMessage(ctx.botToken, channelId, result.text);
+          }
         } else {
           await sendDiscordMessage(ctx.botToken, channelId, result.text);
         }
@@ -418,7 +436,7 @@ export async function handleDiscordMessage(
       }
     }
   } catch (err) {
-    clearInterval(typingInterval);
+    typingLoop.stop();
     const errMsg = err instanceof Error ? err.message : "Internal error";
     await sendDiscordMessage(ctx.botToken, channelId, `Error: ${errMsg}`);
   }
@@ -484,17 +502,29 @@ async function handleDiscordOnlyCommand(
 
 // ───────────────────────── Typing Indicator ─────────────────────────
 
-function startTypingLoop(botToken: string, channelId: string): ReturnType<typeof setInterval> {
-  triggerTyping(botToken, channelId);
+function startTypingLoop(botToken: string, channelId: string): { stop: () => void; ping: () => void } {
+  void triggerTyping(botToken, channelId);
   // Discord typing indicator lasts 10s, refresh every 8s
-  return setInterval(() => triggerTyping(botToken, channelId), 8000);
+  const timer = setInterval(() => {
+    void triggerTyping(botToken, channelId);
+  }, 8000);
+  return {
+    stop: () => clearInterval(timer),
+    ping: () => {
+      void triggerTyping(botToken, channelId);
+    },
+  };
 }
 
-function triggerTyping(botToken: string, channelId: string): void {
-  fetch(`${DISCORD_API}/channels/${channelId}/typing`, {
-    method: "POST",
-    headers: { Authorization: `Bot ${botToken}` },
-  }).catch(() => {});
+async function triggerTyping(botToken: string, channelId: string): Promise<void> {
+  try {
+    await fetch(`${DISCORD_API}/channels/${channelId}/typing`, {
+      method: "POST",
+      headers: { Authorization: `Bot ${botToken}` },
+    });
+  } catch {
+    // Non-fatal
+  }
 }
 
 // ───────────────────────── Send Message ─────────────────────────
@@ -540,8 +570,7 @@ async function editDiscordMessage(
   channelId: string,
   messageId: string,
   text: string,
-): Promise<boolean> {
-  // Discord edit: max 2000 chars, truncate if needed
+): Promise<DiscordEditResult> {
   const content = text.length > MAX_LENGTH ? text.slice(0, MAX_LENGTH - 3) + "..." : text;
   try {
     const resp = await fetch(`${DISCORD_API}/channels/${channelId}/messages/${messageId}`, {
@@ -549,8 +578,31 @@ async function editDiscordMessage(
       headers: { Authorization: `Bot ${botToken}`, "Content-Type": "application/json" },
       body: JSON.stringify({ content }),
     });
-    return resp.ok;
-  } catch { return false; }
+    if (resp.ok) return { ok: true };
+
+    if (resp.status === 404) {
+      return { ok: false, reason: "missing" };
+    }
+
+    if (resp.status === 429) {
+      const data = await resp.json<{ retry_after?: number }>().catch(() => null);
+      const retryAfter = data?.retry_after;
+      return {
+        ok: false,
+        reason: "rate_limited",
+        retryAfterMs: typeof retryAfter === "number" ? Math.ceil(retryAfter * 1000) : undefined,
+      };
+    }
+
+    const errText = await resp.text().catch(() => "");
+    if (errText.includes("Must be 2000 or fewer")) {
+      return { ok: false, reason: "too_long" };
+    }
+
+    return { ok: false, reason: "error" };
+  } catch {
+    return { ok: false, reason: "error" };
+  }
 }
 
 // ───────────────────────── Interaction Response Helpers ─────────────────────────
@@ -636,6 +688,91 @@ function splitMessage(text: string, maxLen: number): string[] {
     remaining = remaining.slice(splitIdx);
   }
   return chunks;
+}
+
+async function replaceDiscordPlaceholder(
+  botToken: string,
+  channelId: string,
+  placeholderMsgId: string,
+  text: string,
+): Promise<string | undefined> {
+  const chunks = splitMessage(text, MAX_LENGTH);
+  if (chunks.length === 0) return undefined;
+
+  const edited = await editDiscordMessage(botToken, channelId, placeholderMsgId, chunks[0]);
+  let lastMessageId = edited.ok ? placeholderMsgId : undefined;
+  const startIndex = edited.ok ? 1 : 0;
+
+  for (let i = startIndex; i < chunks.length; i++) {
+    const sentId = await sendDiscordMessage(botToken, channelId, chunks[i]);
+    if (sentId) lastMessageId = sentId;
+  }
+
+  return lastMessageId;
+}
+
+function resolveDiscordRoutingOptions(ctx: DiscordContext): DiscordRoutingOptions {
+  return {
+    applicationId: ctx.applicationId,
+    requireMention: parseBooleanFlag(ctx.env.DISCORD_REQUIRE_MENTION, true),
+    freeResponseChannels: parseCsvSet(ctx.env.DISCORD_FREE_RESPONSE_CHANNELS),
+  };
+}
+
+export function shouldProcessDiscordMessage(
+  message: DiscordMessage,
+  options: DiscordRoutingOptions,
+): boolean {
+  if (!message.guild_id) return true;
+  if ((message.content ?? "").trim().startsWith("/")) return true;
+
+  const freeChannels = new Set(options.freeResponseChannels ?? []);
+  if (freeChannels.has(message.channel_id)) return true;
+  if (isReplyToBot(message, options.applicationId)) return true;
+  if (options.requireMention === false) return true;
+
+  const content = message.content ?? "";
+  if (mentionsDiscordBot(content, options.applicationId)) return true;
+  if (containsAnyDiscordMention(content)) return false;
+  return false;
+}
+
+export function stripDiscordBotMentions(text: string, applicationId: string): string {
+  if (!text.trim()) return text;
+  const pattern = new RegExp(`<@!?${escapeRegExp(applicationId)}>\\s*`, "g");
+  const stripped = text.replace(pattern, "").trim();
+  return stripped || text.trim();
+}
+
+function isReplyToBot(message: DiscordMessage, applicationId: string): boolean {
+  return message.referenced_message?.author?.id === applicationId;
+}
+
+function mentionsDiscordBot(content: string, applicationId: string): boolean {
+  return new RegExp(`<@!?${escapeRegExp(applicationId)}>`, "g").test(content);
+}
+
+function containsAnyDiscordMention(content: string): boolean {
+  return /<@!?\d+>/.test(content);
+}
+
+function parseCsvSet(value?: string): Set<string> {
+  if (!value) return new Set();
+  return new Set(
+    value
+      .split(",")
+      .map((part) => part.trim())
+      .filter(Boolean),
+  );
+}
+
+function parseBooleanFlag(value: string | undefined, fallback: boolean): boolean {
+  if (value == null) return fallback;
+  return !["false", "0", "no", "off"].includes(value.trim().toLowerCase());
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
 function guessMimeFromFilename(name: string): string {

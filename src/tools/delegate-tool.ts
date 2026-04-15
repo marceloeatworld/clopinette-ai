@@ -31,8 +31,8 @@ export function createDelegateTool(ctx: ToolContext & { onToolProgress?: (name: 
       "Delegate independent research tasks to async sub-agents that run in the background.\n" +
       "Returns IMMEDIATELY — the user can keep chatting while sub-agents work.\n" +
       "Results are automatically injected into the conversation when complete (next turn).\n" +
-      "Sub-agents have web search and browser — they cannot write to memory.\n" +
-      "Use for: parallel research on 2-3 topics, deep web research, gathering diverse info.\n" +
+      "Sub-agents have web search + URL read only — no browser, no memory writes.\n" +
+      "Use for: parallel research on 2-3 complementary angles, deep web research, gathering diverse info.\n" +
       "Do NOT delegate simple lookups — use web or docs directly.",
     inputSchema: z.object({
       goal: z.string().optional().describe("Single task: what the sub-agent should accomplish"),

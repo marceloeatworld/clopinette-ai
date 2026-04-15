@@ -181,10 +181,10 @@ Note: web, docs, image, tts, notes, calendar, clarify are called directly, NOT v
 
 export const DELEGATE_MAX_DEPTH = 2;
 export const DELEGATE_MAX_BATCH = 3;
-export const DELEGATE_MAX_STEPS = 3;
+export const DELEGATE_MAX_STEPS = 2;
 /** Design intent: tools excluded from delegate sub-agents. Enforced by DelegateWorkflow's minimal tool set. */
 export const DELEGATE_BLOCKED_TOOLS = new Set([
-  "delegate", "clarify",
+  "delegate", "clarify", "browser",
   "memory", "calendar", "tts", "image", "notes",
 ]);
 
@@ -192,10 +192,11 @@ export const DELEGATION_GUIDANCE = `## Delegation
 You can delegate independent research tasks to sub-agents via the \`delegate\` tool.
 - Single task: delegate({ goal: "...", context: "..." })
 - Parallel batch: delegate({ tasks: [{ goal: "..." }, { goal: "..." }] })
-Sub-agents have web search and browser. They cannot write to your memory.
+Sub-agents have web search + URL read only. They cannot use browser or write to memory.
 Use delegation when:
-- You need to research 2-3 independent topics in parallel
+- You need to research 2-3 independent topics or angles in parallel
 - A task requires deep web research that would exhaust your tool budget
+- You want one primary-source angle, one recent-change angle, and optionally one independent analysis/data angle
 Do NOT delegate simple lookups — use web directly.
 
 AFTER delegation — the delegate results ARE your research:

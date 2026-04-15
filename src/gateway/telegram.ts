@@ -3,6 +3,13 @@ import type { MediaAsset } from "../config/types.js";
 import type { MediaDelivery } from "../pipeline.js";
 import { downloadTelegramFile } from "../media/handler.js";
 import { handleCommand } from "../commands.js";
+import {
+  formatTelegramMessage,
+  splitTelegramMessage,
+  stripTelegramMarkdown,
+  TELEGRAM_MAX_LENGTH,
+} from "./telegram-format.js";
+import { TelegramProgressController, type TelegramEditResult } from "./telegram-progress.js";
 
 // ───────────────────────── Types ─────────────────────────
 
@@ -227,7 +234,7 @@ export async function handleTelegramUpdate(
       onCacheInvalidate: ctx.onCacheInvalidate,
     });
     if (sharedResult?.handled === true) {
-      await sendTelegramMessage(botToken, chatId, escapeMarkdownV2(sharedResult.text), messageId);
+      await sendTelegramMessage(botToken, chatId, sharedResult.text, messageId);
       return new Response("ok");
     }
     if (sharedResult?.handled === false) {
@@ -286,9 +293,20 @@ export async function handleTelegramUpdate(
 
   // 6. React 👀 + send placeholder + start typing indicator
   if (messageId) setReaction(botToken, chatId, messageId, "👀");
-  // Send a quick placeholder — edited later with the real response
-  const placeholderMsgId = await sendQuickPlaceholder(botToken, chatId, messageId);
+  const placeholderMsgId = await sendQuickPlaceholder(
+    botToken,
+    chatId,
+    messageId,
+    TelegramProgressController.initialText(),
+  );
   const typingInterval = startTypingLoop(botToken, chatId);
+  const progressController = placeholderMsgId
+    ? new TelegramProgressController({
+        editMessage: (content) => editTelegramMessage(botToken, chatId, placeholderMsgId, content),
+        pingTyping: () => sendChatAction(botToken, chatId, "typing"),
+      })
+    : null;
+  progressController?.start();
 
   // 7. Build prompt — handle location, reply context, media auto-prompts
   try {
@@ -326,26 +344,16 @@ export async function handleTelegramUpdate(
     }
     if (!prompt) prompt = "";
 
-    // Tool progress: edit the placeholder message with live tool status
-    const TOOL_EMOJIS: Record<string, string> = {
-      web: "🔍", memory: "🧠", history: "📜", skills: "📚", todo: "✅",
-      docs: "📄", notes: "📝", calendar: "📅", image: "🎨", tts: "🔊",
-      codemode: "⚡", browser: "🌐", clarify: "❓",
-    };
-    const progressLines: string[] = [];
     const onToolProgress = placeholderMsgId
       ? (toolName: string, preview: string) => {
-          const emoji = TOOL_EMOJIS[toolName] ?? "⚙️";
-          const line = preview ? `${emoji} ${toolName}: "${preview}"` : `${emoji} ${toolName}...`;
-          progressLines.push(line);
-          // Fire-and-forget edit — don't await to avoid blocking the pipeline
-          editTelegramMessage(botToken, chatId, placeholderMsgId, progressLines.join("\n")).catch(() => {});
+          progressController?.pushToolProgress(toolName, preview);
         }
       : undefined;
 
     const result = await ctx.runPrompt(prompt, mediaAssets.length > 0 ? mediaAssets : undefined, onToolProgress, String(chatId));
 
     clearInterval(typingInterval);
+    progressController?.stop();
 
     // Stamp user message with Telegram message_id for ✍️ reaction-to-note
     if (messageId) {
@@ -355,9 +363,12 @@ export async function handleTelegramUpdate(
 
     if ("error" in result) {
       if (placeholderMsgId) {
-        await editTelegramMessage(botToken, chatId, placeholderMsgId, escapeMarkdownV2(result.error));
+        const edited = await editTelegramMessage(botToken, chatId, placeholderMsgId, result.error);
+        if (!edited.ok) {
+          await sendTelegramMessage(botToken, chatId, result.error, messageId);
+        }
       } else {
-        await sendTelegramMessage(botToken, chatId, escapeMarkdownV2(result.error), messageId);
+        await sendTelegramMessage(botToken, chatId, result.error, messageId);
       }
     } else {
       // Edit placeholder with real response (or send new if placeholder failed)
@@ -366,9 +377,9 @@ export async function handleTelegramUpdate(
           inline_keyboard: [[{ text: "📝", callback_data: "save_note" }]],
         };
         let sentMsgId: number | undefined;
-        if (placeholderMsgId) {
+        if (placeholderMsgId && progressController?.editable !== false) {
           const edited = await editTelegramMessage(botToken, chatId, placeholderMsgId, result.text, noteKeyboard);
-          sentMsgId = edited ? placeholderMsgId : undefined;
+          sentMsgId = edited.ok ? placeholderMsgId : undefined;
         }
         // Fallback: send new message if edit failed or no placeholder
         if (!sentMsgId) {
@@ -404,9 +415,10 @@ export async function handleTelegramUpdate(
     if (messageId) setReaction(botToken, chatId, messageId, "✅");
   } catch (err) {
     clearInterval(typingInterval);
+    progressController?.stop();
     if (messageId) setReaction(botToken, chatId, messageId, "❌");
     const msg = err instanceof Error ? err.message : "Internal error";
-    await sendTelegramMessage(botToken, chatId, `Error: ${escapeMarkdownV2(msg)}`, messageId);
+    await sendTelegramMessage(botToken, chatId, `Error: ${msg}`, messageId);
   }
 
   return new Response("ok");
@@ -425,13 +437,13 @@ async function handleTelegramOnlyCommand(
   switch (cmd) {
     case "/start":
       return [
-        "Hi\\! I'm Clopinette\\.",
+        "Hi! I'm Clopinette.",
         "",
-        "Send me a message, a photo, or a voice note and I'll help you out\\.",
+        "Send me a message, a photo, or a voice note and I'll help you out.",
         "",
-        "Already have an account? Use /link to connect your Telegram to your web account\\. Same memory, same files, everywhere\\.",
+        "Already have an account? Use /link to connect your Telegram to your web account. Same memory, same files, everywhere.",
         "",
-        "New here? Sign up at clopinette\\.app",
+        "New here? Sign up at clopinette.app",
       ].join("\n");
     case "/link": {
       const chatIdStr = String(chatId);
@@ -441,10 +453,10 @@ async function handleTelegramOnlyCommand(
       // Groups require mode choice: /link trusted or /link shared
       if (isGroup && !arg) {
         return [
-          "*Choose a linking mode:*",
+          "**Choose a linking mode:**",
           "",
-          "`/link trusted` \\— Family mode\\. Full memory, skills, and history shared with everyone in this group\\.",
-          "`/link shared` \\— Public mode\\. Clean bot, no private memory\\. Good for friend groups\\.",
+          "`/link trusted` - Family mode. Full memory, skills, and history shared with everyone in this group.",
+          "`/link shared` - Public mode. Clean bot, no private memory. Good for friend groups.",
         ].join("\n");
       }
 
@@ -459,8 +471,8 @@ async function handleTelegramOnlyCommand(
         ...(isShared && { shared: true }),
       });
       await ctx.env.LINKS.put(`link_code:${code}`, payload, { expirationTtl: 300 });
-      const mode = isShared ? "shared \\(no private memory\\)" : "trusted \\(full memory\\)";
-      return `Your link code: \`${code}\`\nMode: ${mode}\n\nEnter this code in the web app to link\\. Expires in 5 minutes\\.`;
+      const mode = isShared ? "shared (no private memory)" : "trusted (full memory)";
+      return `Your link code: \`${code}\`\nMode: ${mode}\n\nEnter this code in the web app to link. Expires in 5 minutes.`;
     }
     default:
       return null;
@@ -517,6 +529,7 @@ async function sendQuickPlaceholder(
   botToken: string,
   chatId: number,
   replyTo?: number,
+  text = "...",
 ): Promise<number | undefined> {
   try {
     const resp = await fetch(`https://api.telegram.org/bot${botToken}/sendMessage`, {
@@ -524,7 +537,7 @@ async function sendQuickPlaceholder(
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         chat_id: chatId,
-        text: "...",
+        text,
         ...(replyTo && { reply_to_message_id: replyTo }),
       }),
     });
@@ -542,40 +555,57 @@ async function editTelegramMessage(
   messageId: number,
   text: string,
   replyMarkup?: Record<string, unknown>,
-): Promise<boolean> {
+): Promise<TelegramEditResult> {
+  const endpoint = `https://api.telegram.org/bot${botToken}/editMessageText`;
+
   try {
-    const resp = await fetch(`https://api.telegram.org/bot${botToken}/editMessageText`, {
+    const formatted = formatTelegramMessage(text);
+    const resp = await fetch(endpoint, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         chat_id: chatId,
         message_id: messageId,
-        text,
+        text: formatted,
         parse_mode: "MarkdownV2",
         ...(replyMarkup && { reply_markup: replyMarkup }),
       }),
     });
-    if (!resp.ok) {
-      // Fallback: if MarkdownV2 fails, retry plain text
-      const resp2 = await fetch(`https://api.telegram.org/bot${botToken}/editMessageText`, {
+
+    if (resp.ok) return { ok: true };
+
+    const err = await resp.json<{ description?: string; parameters?: { retry_after?: number } }>().catch(() => null);
+    const desc = err?.description?.toLowerCase() ?? "";
+    const retryAfterMs = (err?.parameters?.retry_after ?? 0) * 1000;
+
+    if (desc.includes("not modified")) return { ok: true, reason: "not_modified" };
+    if (desc.includes("too long") || desc.includes("message_too_long")) {
+      return { ok: false, reason: "too_long" };
+    }
+    if (retryAfterMs > 0 || desc.includes("retry after") || desc.includes("flood")) {
+      return { ok: false, reason: "flood_control", retryAfterMs: retryAfterMs || 1000 };
+    }
+    if (desc.includes("parse") || desc.includes("markdown") || desc.includes("entity")) {
+      const plainResp = await fetch(endpoint, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           chat_id: chatId,
           message_id: messageId,
-          text: text.replace(/([_*\[\]()~`>#+\-=|{}.!\\])/g, ""),
+          text: stripTelegramMarkdown(text),
           ...(replyMarkup && { reply_markup: replyMarkup }),
         }),
       });
-      return resp2.ok;
+      return plainResp.ok ? { ok: true } : { ok: false, reason: "parse_error" };
     }
-    return true;
-  } catch { return false; }
+    return { ok: false, reason: "error" };
+  } catch {
+    return { ok: false, reason: "error" };
+  }
 }
 
 // ───────────────────────── Send Message ─────────────────────────
 
-const TELEGRAM_MAX_LENGTH = 4096;
 const MAX_SEND_RETRIES = 3;
 
 export async function sendTelegramMessage(
@@ -585,14 +615,14 @@ export async function sendTelegramMessage(
   replyToMessageId?: number,
   replyMarkup?: Record<string, unknown>
 ): Promise<number | undefined> {
-  const chunks = splitMessage(text, TELEGRAM_MAX_LENGTH);
+  const chunks = splitTelegramMessage(text, TELEGRAM_MAX_LENGTH);
   const total = chunks.length;
   let lastMessageId: number | undefined;
 
   for (let i = 0; i < chunks.length; i++) {
     let chunk = chunks[i];
     if (total > 1) {
-      chunk += `\n\n\\(${i + 1}/${total}\\)`;
+      chunk += `\n\n(${i + 1}/${total})`;
     }
     // Only reply-quote the first chunk, only attach keyboard to the last chunk
     const isLast = i === chunks.length - 1;
@@ -613,16 +643,18 @@ async function sendChunkWithFallback(
   replyToMessageId?: number,
   replyMarkup?: Record<string, unknown>
 ): Promise<number | undefined> {
+  const endpoint = `https://api.telegram.org/bot${botToken}/sendMessage`;
   for (let attempt = 0; attempt < MAX_SEND_RETRIES; attempt++) {
     try {
+      const formatted = formatTelegramMessage(chunk);
       const resp = await fetch(
-        `https://api.telegram.org/bot${botToken}/sendMessage`,
+        endpoint,
         {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
             chat_id: chatId,
-            text: chunk,
+            text: formatted,
             parse_mode: "MarkdownV2",
             ...(replyToMessageId && { reply_to_message_id: replyToMessageId }),
             ...(replyMarkup && { reply_markup: replyMarkup }),
@@ -639,16 +671,19 @@ async function sendChunkWithFallback(
       const desc = err?.description?.toLowerCase() ?? "";
 
       if (desc.includes("parse") || desc.includes("markdown") || desc.includes("entity")) {
-        await fetch(`https://api.telegram.org/bot${botToken}/sendMessage`, {
+        const plainResp = await fetch(endpoint, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
             chat_id: chatId,
-            text: stripMarkdown(chunk),
+            text: stripTelegramMarkdown(chunk),
             ...(replyToMessageId && { reply_to_message_id: replyToMessageId }),
+            ...(replyMarkup && { reply_markup: replyMarkup }),
           }),
         });
-        return;
+        if (!plainResp.ok) return;
+        const data = await plainResp.json<{ result?: { message_id?: number } }>().catch(() => null);
+        return data?.result?.message_id;
       }
 
       const retryMatch = desc.match(/retry after (\d+)/);
@@ -664,63 +699,6 @@ async function sendChunkWithFallback(
       }
     }
   }
-}
-
-// ───────────────────────── Message Splitting ─────────────────────────
-
-function splitMessage(text: string, maxLen: number): string[] {
-  if (text.length <= maxLen) return [text];
-
-  const chunks: string[] = [];
-  let remaining = text;
-  let openCodeLang: string | null = null;
-
-  while (remaining.length > 0) {
-    if (remaining.length <= maxLen) {
-      chunks.push(remaining);
-      break;
-    }
-
-    let splitIdx = remaining.lastIndexOf("\n", maxLen);
-    if (splitIdx < maxLen / 3) splitIdx = maxLen;
-
-    let chunk = remaining.slice(0, splitIdx);
-    remaining = remaining.slice(splitIdx);
-
-    if (openCodeLang) {
-      chunk = `\`\`\`${openCodeLang}\n${chunk}`;
-      openCodeLang = null;
-    }
-
-    const totalFences = chunk.match(/```/g);
-    const isOpen = totalFences ? totalFences.length % 2 !== 0 : false;
-
-    if (isOpen) {
-      const langMatch = chunk.match(/```(\w*)\n/);
-      openCodeLang = langMatch?.[1] ?? "";
-      chunk += "\n```";
-    }
-
-    chunks.push(chunk);
-  }
-
-  return chunks;
-}
-
-// ───────────────────────── Formatting ─────────────────────────
-
-function escapeMarkdownV2(text: string): string {
-  return text.replace(/([_*\[\]()~`>#+\-=|{}.!\\])/g, "\\$1");
-}
-
-function stripMarkdown(text: string): string {
-  return text
-    .replace(/\\([_*\[\]()~`>#+\-=|{}.!\\])/g, "$1")
-    .replace(/\*\*(.+?)\*\*/g, "$1")
-    .replace(/\*(.+?)\*/g, "$1")
-    .replace(/_(.+?)_/g, "$1")
-    .replace(/~(.+?)~/g, "$1")
-    .replace(/\|\|(.+?)\|\|/g, "$1");
 }
 
 async function answerCallbackQuery(

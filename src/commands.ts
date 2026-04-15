@@ -2,6 +2,7 @@ import type { SqlFn } from "./config/sql.js";
 import { searchSessions } from "./memory/session-search.js";
 import { PERSONALITIES, PERSONALITY_NAMES } from "./config/personalities.js";
 import { DEFAULT_SOUL_MD, DEFAULT_MODEL, WORKERS_AI_MODELS, isWorkersAiModel } from "./config/constants.js";
+import { buildResearchRewritePrompt } from "./delegation.js";
 import { readMonthlyUsage } from "./enterprise/budget.js";
 
 /**
@@ -512,25 +513,13 @@ export async function handleCommand(
 
     case "/research":
     case "/deepsearch": {
-      // Deep research mode: rewrite the user prompt so the LLM is strongly
-      // pushed toward the `delegate` tool with a multi-angle decomposition
-      // and source-diversity requirement. The auto-resume in onDelegateComplete
-      // then synthesizes the results back into a single reply.
       if (!arg) {
         return {
           text: "Usage: `/research <topic>` — launches 2-3 parallel sub-agents to research the topic from different angles, then synthesizes the findings.",
           handled: true,
         };
       }
-      const rewriteAs =
-        `[RESEARCH MODE] You MUST use the delegate tool to launch 2 or 3 parallel sub-agents on different angles of this topic. Each delegate goal should target a distinct angle (e.g. official sources / academic papers / recent news / NGO reports / data points). After delegating, briefly tell the user research is in progress — the auto-resume will deliver the synthesized answer when all delegates complete.\n\n` +
-        `Hard rules:\n` +
-        `- DO use delegate({ tasks: [...] }) with 2-3 distinct goals.\n` +
-        `- DO target distinct domains/sources for each goal.\n` +
-        `- Do NOT call web/docs directly first — go straight to delegate.\n` +
-        `- Do NOT answer from memory.\n\n` +
-        `Topic: ${arg}`;
-      return { handled: false, rewriteAs };
+      return { handled: false, rewriteAs: buildResearchRewritePrompt(arg) };
     }
 
     case "/help":

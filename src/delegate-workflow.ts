@@ -1,18 +1,19 @@
 import { WorkflowEntrypoint, type WorkflowEvent, type WorkflowStep } from "cloudflare:workers";
 import { generateText, stepCountIs } from "ai";
 import { getAgentByName } from "agents";
-import { createWebTool } from "./tools/web-tool.js";
-import { createBrowserTool } from "./tools/browser-tool.js";
 import {
   DELEGATE_MAX_DEPTH,
   DELEGATE_MAX_STEPS,
 } from "./config/constants.js";
 import {
+  buildDelegateSystemPrompt,
+  buildDelegateTools,
+} from "./delegation.js";
+import {
   createModel,
   createAuxiliaryModel,
   PlanViolationError,
 } from "./inference/provider.js";
-import type { ToolContext } from "./tools/registry.js";
 
 /**
  * Async delegation via Cloudflare Workflows.
@@ -35,16 +36,6 @@ export interface DelegateWorkflowParams {
   userId: string;         // Parent DO name
   sessionId: string;      // Parent session the result gets injected into
 }
-
-const DELEGATE_SYSTEM_PROMPT = `You are a focused research sub-agent. You have a STRICT budget of 2 tool calls.
-
-Rules:
-- Do exactly 1 web search. If snippets answer the question, respond immediately.
-- Only read a URL if snippets genuinely lack detail. Read at most 1 URL.
-- NEVER repeat a search with a different query variation. One search, then answer.
-- NEVER make up information. If you can't find it, say so.
-
-Provide a clear, concise summary of what you found.`;
 
 interface InferenceOutcome {
   status: "success" | "error";
@@ -92,7 +83,11 @@ export class DelegateWorkflow extends WorkflowEntrypoint<Env, DelegateWorkflowPa
     return outcome;
   }
 
-  async #runInference(goal: string, context: string | undefined, userId: string): Promise<InferenceOutcome> {
+  async #runInference(
+    goal: string,
+    context: string | undefined,
+    userId: string,
+  ): Promise<InferenceOutcome> {
     const start = Date.now();
     const toolTrace: string[] = [];
     let modelId = "";
@@ -127,35 +122,15 @@ export class DelegateWorkflow extends WorkflowEntrypoint<Env, DelegateWorkflowPa
         throw err;
       }
 
-      // Stateless tool context — no SQLite, no R2 writes, no memory.
-      // auxModel is the BYOK-aware model used by web summarization + browser snapshots.
-      const minimalCtx: ToolContext = {
-        sql: (() => []) as unknown as ToolContext["sql"],
-        r2Memories: null as unknown as R2Bucket,
-        r2Skills: null as unknown as R2Bucket,
-        ai: this.env.AI,
-        auxModel: auxiliary.model,
-        auxModelId: auxiliary.modelId,
-        userId: "delegate",
-        sessionId: "delegate",
-        env: { WS_SIGNING_SECRET: this.env.WS_SIGNING_SECRET },
+      // Delegates stay retry-safe by using the web tool only: one search plus
+      // at most one read. Interactive browser state is intentionally excluded.
+      const tools: Record<string, unknown> = buildDelegateTools({
         cfAccountId: this.env.CF_ACCOUNT_ID,
         cfBrowserToken: this.env.CF_BROWSER_TOKEN,
+        auxModel: auxiliary.model,
         searxngUrl: this.env.SEARXNG_URL,
         braveApiKey: this.env.BRAVE_API_KEY,
-        playwrightMcp: this.env.PlaywrightMCP,
-      };
-
-      const tools: Record<string, unknown> = {
-        web: createWebTool(
-          minimalCtx.cfAccountId,
-          minimalCtx.cfBrowserToken,
-          minimalCtx.auxModel,
-          minimalCtx.searxngUrl,
-          minimalCtx.braveApiKey,
-        ),
-        ...(minimalCtx.playwrightMcp ? { browser: createBrowserTool(minimalCtx) } : {}),
-      };
+      });
 
       // Dedup + trace wrapper
       const dedupCache = new Map<string, { result: unknown; ts: number }>();
@@ -178,8 +153,7 @@ export class DelegateWorkflow extends WorkflowEntrypoint<Env, DelegateWorkflowPa
               dedupCache.set(dedupKey, { result, ts: Date.now() });
               stepCount++;
 
-              const pct = stepCount / DELEGATE_MAX_STEPS;
-              if (pct >= 0.5 && typeof result === "object" && result !== null) {
+              if (stepCount >= DELEGATE_MAX_STEPS - 1 && typeof result === "object" && result !== null) {
                 return { ...result, _budget: "CRITICAL: You have used most of your steps. Respond NOW with what you have." };
               }
               return result;
@@ -188,11 +162,7 @@ export class DelegateWorkflow extends WorkflowEntrypoint<Env, DelegateWorkflowPa
         }),
       );
 
-      const systemPrompt = [
-        DELEGATE_SYSTEM_PROMPT,
-        `\nYOUR TASK:\n${goal}`,
-        context ? `\nCONTEXT:\n${context}` : "",
-      ].join("");
+      const systemPrompt = buildDelegateSystemPrompt(goal, context);
 
       const result = await generateText({
         model,

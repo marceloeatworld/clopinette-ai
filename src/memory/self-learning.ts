@@ -63,6 +63,14 @@ const SKILL_REVIEW_PROMPT = `Review the conversation above and consider saving o
 
 Focus on: was a non-trivial approach used to complete a task that required trial and error, or changing course due to experiential findings, or did the user expect or desire a different method or outcome?
 
+Skill content should be reusable markdown, not loose notes.
+Prefer this structure:
+- A short intro
+- ## When to Use
+- ## Procedure
+- ## Pitfalls
+- ## Verification
+
 Respond with a JSON object:
 {
   "skill_actions": [
@@ -70,7 +78,7 @@ Respond with a JSON object:
       "action": "create" | "update",
       "name": "skill-name",
       "description": "one-line description",
-      "content": "Full skill content with steps, pitfalls, verification",
+      "content": "Structured markdown skill body",
       "category": "optional category"
     }
   ]
@@ -144,6 +152,11 @@ Save when: user corrects you, shares preferences/personal details (→ "user"), 
 NEVER save personality/persona traits: speaking style, character names, role-play behavior, catchphrases — these come from a switchable preset and must NOT be stored as permanent facts.
 
 **Skills**: Was a non-trivial approach used that required trial and error, experiential findings, or course corrections? If a relevant skill already exists, update it. Otherwise, create a new one if reusable.
+Skill content should be reusable markdown, ideally with:
+- ## When to Use
+- ## Procedure
+- ## Pitfalls
+- ## Verification
 
 ${memoryCompactionRules(memoryState)}
 
