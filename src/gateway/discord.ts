@@ -314,8 +314,6 @@ export async function handleDiscordMessage(
   message: DiscordMessage,
   ctx: DiscordContext,
 ): Promise<void> {
-  if (!shouldProcessDiscordMessage(message, resolveDiscordRoutingOptions(ctx))) return;
-
   const channelId = message.channel_id;
   let text = stripDiscordBotMentions(message.content ?? "", ctx.applicationId);
 
