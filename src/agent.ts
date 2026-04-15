@@ -837,7 +837,16 @@ export class ClopinetteAgent extends AIChatAgent<Env, AgentState> {
   @callable()
   async getMemory(type: "memory" | "user"): Promise<{ content: string }> {
     const { getPromptMemory } = await import("./memory/prompt-memory.js");
-    return { content: getPromptMemory(this.sql.bind(this), type) };
+    let content = getPromptMemory(this.sql.bind(this), type);
+    if (!content) {
+      try {
+        await this.#restoreMemoryFromR2();
+        content = getPromptMemory(this.sql.bind(this), type);
+      } catch (err) {
+        console.warn(`getMemory restore retry failed for ${type}:`, err);
+      }
+    }
+    return { content };
   }
 
   @callable()
@@ -1974,21 +1983,21 @@ export class ClopinetteAgent extends AIChatAgent<Env, AgentState> {
   async #restoreMemoryFromR2(): Promise<void> {
     const memory = getPromptMemory(this.sql.bind(this), "memory");
     const user = getPromptMemory(this.sql.bind(this), "user");
-    if (memory || user) return;
+    if (memory && user) return;
 
     const safeId = this.#userId.replace(/[^a-zA-Z0-9_-]/g, "");
     const [memObj, userObj] = await Promise.all([
-      this.env.MEMORIES.get(`${safeId}/MEMORY.md`),
-      this.env.MEMORIES.get(`${safeId}/USER.md`),
+      memory ? Promise.resolve(null) : this.env.MEMORIES.get(`${safeId}/MEMORY.md`),
+      user ? Promise.resolve(null) : this.env.MEMORIES.get(`${safeId}/USER.md`),
     ]);
 
-    if (memObj) {
+    if (!memory && memObj) {
       const text = await memObj.text();
       if (text.trim()) {
         this.sql`UPDATE prompt_memory SET content = ${text}, updated_at = datetime('now') WHERE type = 'memory'`;
       }
     }
-    if (userObj) {
+    if (!user && userObj) {
       const text = await userObj.text();
       if (text.trim()) {
         this.sql`UPDATE prompt_memory SET content = ${text}, updated_at = datetime('now') WHERE type = 'user'`;
