@@ -920,7 +920,10 @@ export class ClopinetteAgent extends AIChatAgent<Env, AgentState> {
   async deleteSkillAdmin(name: string): Promise<{ ok: boolean }> {
     const { deleteSkill } = await import("./memory/skills.js");
     const result = await deleteSkill(this.sql.bind(this), this.env.SKILLS, this.#userId, name);
-    if (result.ok) logAudit(this.sql.bind(this), "admin.skill.delete", name);
+    if (result.ok) {
+      try { this.sql`DELETE FROM hub_installed WHERE name = ${name}`; } catch { /* ignore */ }
+      logAudit(this.sql.bind(this), "admin.skill.delete", name);
+    }
     return result;
   }
 
@@ -1067,6 +1070,9 @@ export class ClopinetteAgent extends AIChatAgent<Env, AgentState> {
   async hubInstall(source: string, identifier: string): Promise<import("./hub/types.js").HubInstallResult> {
     const { installSkill } = await import("./hub/install.js");
     let bundle: import("./hub/types.js").HubSkillBundle | null = null;
+    const looksLikeGitHubSkill = identifier.split("/").length >= 3;
+    const { TRUSTED_REPOS } = await import("./hub/catalog.js");
+    const trustedAlias = TRUSTED_REPOS.find((repo) => repo.id === source || repo.collection === source);
 
     if (source === "catalog") {
       const { getCatalogSkill } = await import("./hub/catalog.js");
@@ -1074,7 +1080,7 @@ export class ClopinetteAgent extends AIChatAgent<Env, AgentState> {
       if (skill) {
         bundle = { meta: skill.meta, content: skill.content, frontmatter: {} };
       }
-    } else if (source === "github") {
+    } else if (source === "github" || (!!trustedAlias && looksLikeGitHubSkill)) {
       const { GitHubSource } = await import("./hub/github-source.js");
       GitHubSource.setToken(this.env.GITHUB_TOKEN);
       bundle = await new GitHubSource().fetch(identifier);
