@@ -17,8 +17,16 @@ const MAX_SNAPSHOT_LENGTH = 12000;
 const SNAPSHOT_SUMMARIZE_THRESHOLD = 8000;
 const MCP_TIMEOUT = 30_000;
 
+interface BrowserToolSession {
+  sessionId: string | null;
+  msgId: number;
+  lastAction?: string;
+  lastKnownUrl?: string;
+  lastTouchedAt?: string;
+}
+
 // MCP session state per userId (lazy init)
-const sessions = new Map<string, { sessionId: string | null; msgId: number }>();
+const sessions = new Map<string, BrowserToolSession>();
 
 // Action -> MCP tool name mapping
 const ACTION_MAP: Record<string, string> = {
@@ -40,11 +48,14 @@ export function createBrowserTool(ctx: ToolContext) {
     description:
       "Interactive web browser. Navigate to URLs, see page content (snapshot), click elements, " +
       "fill forms, take screenshots. Use 'snapshot' after navigation to see what's on the page. " +
-      "Elements are identified by 'ref' numbers from the snapshot.",
+      "Elements are identified by 'ref' numbers from the snapshot. " +
+      "Use 'diagnostics' to get Browser Run operator guidance, or 'request_human' " +
+      "when login, MFA, CAPTCHA, or sensitive data entry blocks automation.",
     inputSchema: z.object({
       action: z.enum([
         "navigate", "snapshot", "click", "type", "screenshot",
         "select", "press_key", "wait", "handle_dialog", "go_back", "close",
+        "diagnostics", "request_human",
       ]).describe("Browser action to perform"),
       url: z.string().optional().describe("URL to navigate to (for 'navigate')"),
       ref: z.string().optional().describe("Element ref number from snapshot (for click/type/select)"),
@@ -56,6 +67,7 @@ export function createBrowserTool(ctx: ToolContext) {
       time: z.coerce.number().optional().describe("Seconds to wait (for 'wait')"),
       accept: z.coerce.boolean().optional().describe("Accept or dismiss dialog (for 'handle_dialog')"),
       promptText: z.string().optional().describe("Text for prompt dialog (for 'handle_dialog')"),
+      reason: z.string().optional().describe("Why human intervention is needed (for 'request_human')"),
     }),
     execute: async (params: {
       action: string;
@@ -69,7 +81,18 @@ export function createBrowserTool(ctx: ToolContext) {
       time?: number;
       accept?: boolean;
       promptText?: string;
+      reason?: string;
     }) => {
+      const session = getBrowserSession(ctx.userId);
+
+      if (params.action === "diagnostics") {
+        return buildBrowserDiagnostics(session);
+      }
+
+      if (params.action === "request_human") {
+        return buildHumanHandoff(session, params.reason);
+      }
+
       if (!ctx.playwrightMcp) {
         return { ok: false, error: "Browser not available. PlaywrightMCP binding not configured." };
       }
@@ -112,7 +135,16 @@ export function createBrowserTool(ctx: ToolContext) {
       }
 
       try {
-        const result = await callMcpTool(ctx, mcpToolName, args);
+        const result = await callMcpTool(ctx, session, mcpToolName, args);
+        if (result.ok) {
+          session.lastAction = params.action;
+          session.lastTouchedAt = new Date().toISOString();
+          if (params.action === "navigate" && params.url) {
+            session.lastKnownUrl = params.url;
+          } else if (params.action === "close") {
+            session.lastKnownUrl = undefined;
+          }
+        }
         return result;
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
@@ -126,6 +158,7 @@ export function createBrowserTool(ctx: ToolContext) {
 
 async function callMcpTool(
   ctx: ToolContext,
+  session: BrowserToolSession,
   toolName: string,
   args: Record<string, unknown>
 ): Promise<{ ok: boolean; content?: string; error?: string }> {
@@ -134,10 +167,7 @@ async function callMcpTool(
   const stub = ns.get(id);
 
   // Ensure MCP session is initialized
-  let session = sessions.get(ctx.userId);
-  if (!session) {
-    session = { sessionId: null, msgId: 0 };
-    sessions.set(ctx.userId, session);
+  if (!session.sessionId) {
     await initMcpSession(stub, session);
   }
 
@@ -171,7 +201,7 @@ async function callMcpTool(
 
 async function initMcpSession(
   stub: DurableObjectStub,
-  session: { sessionId: string | null; msgId: number }
+  session: BrowserToolSession
 ): Promise<void> {
   // Initialize
   const initResp = await stub.fetch(new Request("https://mcp/mcp", {
@@ -218,7 +248,7 @@ async function initMcpSession(
 
 async function fetchMcp(
   stub: DurableObjectStub,
-  session: { sessionId: string | null; msgId: number },
+  session: BrowserToolSession,
   request: McpJsonRpc
 ): Promise<McpResponse> {
   const headers: Record<string, string> = {
@@ -348,4 +378,90 @@ interface McpResponse {
   id?: number;
   result?: unknown;
   error?: { code: number; message: string };
+}
+
+function getBrowserSession(userId: string): BrowserToolSession {
+  let session = sessions.get(userId);
+  if (!session) {
+    session = { sessionId: null, msgId: 0 };
+    sessions.set(userId, session);
+  }
+  return session;
+}
+
+function buildBrowserDiagnostics(session: BrowserToolSession) {
+  const diagnostics = {
+    transport: "playwright-mcp",
+    mcpSessionId: session.sessionId,
+    lastAction: session.lastAction,
+    lastKnownUrl: session.lastKnownUrl,
+    lastTouchedAt: session.lastTouchedAt,
+    liveView: {
+      supportedByBrowserRun: true,
+      browserRunSessionIdExposed: false,
+      note:
+        "Browser Run supports Live View for active browser sessions, but the current Playwright MCP wrapper does not expose the Browser Run session ID or live view URL directly in tool results.",
+      commands: [
+        "wrangler browser list",
+        "wrangler browser view <SESSION_ID>",
+      ],
+    },
+    humanInTheLoop: {
+      supportedByBrowserRun: true,
+      recommendedFor: ["login", "MFA", "CAPTCHA", "sensitive form entry"],
+      resumeHint:
+        "After the human finishes in Live View, tell the agent to continue from the current page state.",
+    },
+    sessionRecording: {
+      supportedByBrowserRun: true,
+      enabledInThisWrapper: false,
+      note:
+        "Browser Run Session Recordings require launching the browser with recording:true. The current Playwright MCP wrapper used here does not expose a recording toggle or recording identifiers.",
+    },
+  };
+
+  const lines = [
+    "Browser diagnostics ready.",
+    `Transport: ${diagnostics.transport}`,
+    `MCP session: ${diagnostics.mcpSessionId ?? "not initialized yet"}`,
+    `Last action: ${diagnostics.lastAction ?? "unknown"}`,
+    `Last URL: ${diagnostics.lastKnownUrl ?? "unknown"}`,
+    "Operator flow for Live View:",
+    "1. Run `wrangler browser list` or open the Browser Run dashboard.",
+    "2. Find the active session that matches this automation run.",
+    "3. Open it with `wrangler browser view <SESSION_ID>`.",
+    "4. If a human is needed, complete the blocking step and then resume the agent.",
+    "Session recordings are supported by Browser Run, but not configurable through the current MCP wrapper.",
+  ];
+
+  return { ok: true, content: lines.join("\n"), diagnostics };
+}
+
+function buildHumanHandoff(session: BrowserToolSession, reason?: string) {
+  const handoff = {
+    reason: reason ?? "Browser automation needs a human operator.",
+    mcpSessionId: session.sessionId,
+    lastKnownUrl: session.lastKnownUrl,
+    steps: [
+      "Run `wrangler browser list` or open the Browser Run dashboard.",
+      "Open the matching active session with `wrangler browser view <SESSION_ID>`.",
+      "Complete the blocking step in Live View.",
+      "Return to chat and tell the agent to continue.",
+    ],
+    note:
+      "Use this for login, MFA, CAPTCHA, approval prompts, or any sensitive form entry you do not want to automate.",
+  };
+
+  const lines = [
+    "Human browser handoff requested.",
+    `Reason: ${handoff.reason}`,
+    `Last URL: ${handoff.lastKnownUrl ?? "unknown"}`,
+    "Next steps:",
+    "1. Run `wrangler browser list`.",
+    "2. Open the matching session with `wrangler browser view <SESSION_ID>`.",
+    "3. Complete the blocking action in Live View.",
+    "4. Return here and tell the agent to continue.",
+  ];
+
+  return { ok: true, content: lines.join("\n"), handoff };
 }

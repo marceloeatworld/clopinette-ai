@@ -49,7 +49,7 @@ The LLM sees 12 tools + `codemode` sandbox for orchestration:
 
 | Tool | What it does |
 |---|---|
-| `web` | Search, read URL, scrape, extract, crawl (SearXNG / Brave / Browser Rendering) |
+| `web` | Search, read URL, scrape, extract, crawl, diagnostics (SearXNG / Brave / Browser Run quick actions) |
 | `docs` | RAG search + Q&A over user-uploaded documents (AutoRAG) |
 | `history` | Hybrid keyword + semantic search across past conversations |
 | `memory` | Read / write persistent `MEMORY.md` and `USER.md` |
@@ -60,10 +60,24 @@ The LLM sees 12 tools + `codemode` sandbox for orchestration:
 | `image` | Image generation (FLUX Schnell) |
 | `tts` | Text-to-speech (12 voices, Deepgram Aura) |
 | `clarify` | Ask the user a structured question mid-execution |
-| `browser` | Playwright MCP (navigate, click, type, snapshot) — conditional |
+| `browser` | Playwright MCP (navigate, click, type, snapshot, diagnostics, human handoff) — conditional |
 | `delegate` | Run parallel sub-agents in the background — conditional |
 
 With codemode active (when the `LOADER` binding is set), the LLM writes JavaScript that orchestrates multiple tool calls in one step — up to 5x more token-efficient.
+
+### Browser Run observability
+
+- `browser({ action: "diagnostics" })` returns operator guidance for Browser Run Live View and Human in the Loop.
+- `browser({ action: "request_human", reason: "..." })` produces a structured handoff when login, MFA, CAPTCHA, or sensitive data entry blocks automation.
+- `web` responses backed by Browser Run quick actions now include `browserRun.sessionId`, `browserRun.browserMsUsed`, and `browserRun.cfRay` when Cloudflare returns them.
+- Browser Run Live View / HITL are available for active browser sessions. In this codebase, the current `@cloudflare/playwright-mcp` wrapper does not expose the Browser Run session ID or direct Live View URL in tool results, so the operator flow is:
+
+```bash
+wrangler browser list
+wrangler browser view <SESSION_ID>
+```
+
+- Browser Run Session Recordings require launching a browser session with `recording: true`. The current Playwright MCP wrapper used by Clopinette does not expose a recording toggle yet.
 
 ## Slash commands
 

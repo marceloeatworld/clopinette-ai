@@ -50,6 +50,15 @@ const SUMMARIZE_THRESHOLD = 5000;
 const CHUNK_THRESHOLD = 200_000;
 const CHUNK_SIZE = 50_000;
 
+interface BrowserRunQuickActionMeta {
+  product: "browser-run";
+  integration: "quick-actions";
+  sessionId: string;
+  keepAliveMs: number;
+  browserMsUsed?: number;
+  cfRay?: string;
+}
+
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
 /** Drain response body to prevent Cloudflare Worker deadlock on unconsumed responses. */
@@ -90,13 +99,62 @@ function brBody(url: string, sessionId: string, extra?: Record<string, unknown>)
   };
 }
 
+function parseNumberHeader(resp: Response, header: string): number | undefined {
+  const value = resp.headers.get(header);
+  if (!value) return undefined;
+  const parsed = Number.parseInt(value, 10);
+  return Number.isFinite(parsed) ? parsed : undefined;
+}
+
+function buildBrowserRunMeta(resp: Response, sessionId: string): BrowserRunQuickActionMeta {
+  return {
+    product: "browser-run",
+    integration: "quick-actions",
+    sessionId,
+    keepAliveMs: SESSION_KEEP_ALIVE,
+    browserMsUsed: parseNumberHeader(resp, "x-browser-ms-used"),
+    cfRay: resp.headers.get("cf-ray") ?? undefined,
+  };
+}
+
+function buildQuickActionDiagnostics(
+  sessionId: string,
+  browserTokenConfigured: boolean,
+  searxngConfigured: boolean,
+  braveConfigured: boolean,
+) {
+  return {
+    product: "browser-run",
+    integration: "quick-actions",
+    sessionId,
+    keepAliveMs: SESSION_KEEP_ALIVE,
+    configured: {
+      browserToken: browserTokenConfigured,
+      searxng: searxngConfigured,
+      braveApi: braveConfigured,
+    },
+    notes: [
+      "Quick Actions power the REST-backed web tool calls used for read/extract/scrape/links/crawl and Browser Run fallback search.",
+      "Live View, Human in the Loop, and Session Recordings are documented for Browser Sessions launched via Playwright, Puppeteer, or CDP.",
+      "Each Browser Run REST response can expose x-browser-ms-used and cf-ray for observability.",
+    ],
+  };
+}
+
 interface SearchResult {
   title: string;
   url: string;
   description: string;
 }
 
-type SearchReturn = { ok: boolean; engine: string; query: string; results: SearchResult[]; count: number };
+type SearchReturn = {
+  ok: boolean;
+  engine: string;
+  query: string;
+  results: SearchResult[];
+  count: number;
+  browserRun?: BrowserRunQuickActionMeta;
+};
 
 // ─── SearXNG (self-hosted, ~500ms, unlimited) ──────────────────────────────
 
@@ -161,7 +219,7 @@ async function searchViaScrape(
   count: number,
   engine: "google" | "brave",
   sessionId: string,
-): Promise<{ ok: boolean; engine: string; query: string; results: SearchResult[]; count: number } | null> {
+): Promise<SearchReturn | null> {
   const t0 = Date.now();
   const searchUrl = engine === "google"
     ? `https://www.google.com/search?q=${encodeURIComponent(query)}&num=${count}&hl=en`
@@ -212,7 +270,14 @@ async function searchViaScrape(
     }
     console.log(`[web] ${engine} scrape: ${results.length} results (${Date.now() - t0}ms)`);
     if (results.length === 0) return null;
-    return { ok: true, engine, query, results, count: results.length };
+    return {
+      ok: true,
+      engine,
+      query,
+      results,
+      count: results.length,
+      browserRun: buildBrowserRunMeta(resp, sessionId),
+    };
   } catch (err) {
     console.error(`[web] ${engine} scrape error (${Date.now() - t0}ms):`, err);
     return null;
@@ -246,10 +311,11 @@ export function createWebTool(
       "- 'scrape': targeted CSS selector extraction.\n" +
       "- 'links': list all links on a page.\n" +
       "- 'crawl_start': start async multi-page crawl. Returns a jobId.\n" +
-      "- 'crawl_check': check crawl results by jobId.",
+      "- 'crawl_check': check crawl results by jobId.\n" +
+      "- 'diagnostics': inspect Browser Run quick-action configuration and observability metadata.",
     inputSchema: z.object({
       action: z
-        .enum(["search", "read", "extract", "scrape", "links", "crawl_start", "crawl_check"])
+        .enum(["search", "read", "extract", "scrape", "links", "crawl_start", "crawl_check", "diagnostics"])
         .describe("Action to perform"),
       query: z.string().optional().describe("Search query (for 'search')"),
       url: z.string().optional().describe("URL (for read/extract/scrape/links/crawl_start)"),
@@ -284,8 +350,35 @@ export function createWebTool(
       includePattern?: string;
       excludePattern?: string;
     }) => {
-      if (!browserToken) {
+      if (params.action === "diagnostics") {
+        const diagnostics = buildQuickActionDiagnostics(
+          sessionId,
+          Boolean(browserToken),
+          Boolean(searxngUrl),
+          Boolean(braveApiKey),
+        );
+        return {
+          ok: true,
+          content:
+            `Web diagnostics ready.\n` +
+            `Session: ${sessionId}\n` +
+            `Browser token: ${browserToken ? "configured" : "missing"}\n` +
+            `SearXNG: ${searxngUrl ? "configured" : "missing"}\n` +
+            `Brave API: ${braveApiKey ? "configured" : "missing"}`,
+          diagnostics,
+        };
+      }
+
+      const needsBrowserRun = params.action !== "search";
+      if (needsBrowserRun && !browserToken) {
         return { ok: false, error: "Browser not configured. Set CF_BROWSER_TOKEN secret." };
+      }
+
+      if (params.action === "search" && !browserToken && !searxngUrl && !braveApiKey) {
+        return {
+          ok: false,
+          error: "Search not configured. Set one of: SEARXNG_URL, BRAVE_API_KEY, or CF_BROWSER_TOKEN.",
+        };
       }
 
       await sem.acquire();
@@ -300,10 +393,10 @@ export function createWebTool(
     includePattern?: string; excludePattern?: string;
   }) {
 
-      const headers = {
-        Authorization: `Bearer ${browserToken}`,
+      const headers: Record<string, string> = {
         "Content-Type": "application/json",
       };
+      if (browserToken) headers.Authorization = `Bearer ${browserToken}`;
 
       const waitOpts: Record<string, unknown> = {};
       if (params.waitForSelector) {
@@ -354,11 +447,18 @@ export function createWebTool(
           if (auxModel && raw.length > SUMMARIZE_THRESHOLD) {
             const summary = await summarizeContent(auxModel, raw, params.url);
             if (summary) {
-              return { ok: true, url: params.url, content: summary, originalLength: raw.length, summarized: true };
+              return {
+                ok: true,
+                url: params.url,
+                content: summary,
+                originalLength: raw.length,
+                summarized: true,
+                browserRun: buildBrowserRunMeta(resp, sessionId),
+              };
             }
           }
           const content = raw.length > MAX_OUTPUT ? raw.slice(0, MAX_OUTPUT) + "\n\n[...truncated]" : raw;
-          return { ok: true, url: params.url, content };
+          return { ok: true, url: params.url, content, browserRun: buildBrowserRunMeta(resp, sessionId) };
         }
 
         // ─── EXTRACT (AI structured extraction) ───────────────────────────
@@ -376,7 +476,7 @@ export function createWebTool(
           );
           if (!resp.ok) { await drainResponse(resp); return { ok: false, error: `Browser API error: ${resp.status}` }; }
           const data = await resp.json<{ success: boolean; result: unknown }>();
-          return { ok: true, url: params.url, data: data.result };
+          return { ok: true, url: params.url, data: data.result, browserRun: buildBrowserRunMeta(resp, sessionId) };
         }
 
         // ─── SCRAPE (CSS selector) ────────────────────────────────────────
@@ -397,7 +497,14 @@ export function createWebTool(
           }>();
           const elements = data.result?.[0]?.results ?? [];
           const scraped = elements.map((el) => ({ text: el.text?.slice(0, 2000), attributes: el.attributes }));
-          return { ok: true, url: params.url, selector: params.selector, elements: scraped, count: scraped.length };
+          return {
+            ok: true,
+            url: params.url,
+            selector: params.selector,
+            elements: scraped,
+            count: scraped.length,
+            browserRun: buildBrowserRunMeta(resp, sessionId),
+          };
         }
 
         // ─── LINKS ────────────────────────────────────────────────────────
@@ -409,7 +516,7 @@ export function createWebTool(
           );
           if (!resp.ok) { await drainResponse(resp); return { ok: false, error: `Browser API error: ${resp.status}` }; }
           const data = await resp.json<{ success: boolean; result: Array<{ href: string; text: string }> }>();
-          return { ok: true, url: params.url, links: data.result?.slice(0, 50) };
+          return { ok: true, url: params.url, links: data.result?.slice(0, 50), browserRun: buildBrowserRunMeta(resp, sessionId) };
         }
 
         // ─── CRAWL START ──────────────────────────────────────────────────
@@ -435,7 +542,12 @@ export function createWebTool(
           }
           const data = await resp.json<{ success: boolean; result?: { id: string } }>();
           if (!data.success || !data.result?.id) return { ok: false, error: "Crawl API returned no job ID" };
-          return { ok: true, jobId: data.result.id, message: `Crawl started for ${params.url}. Use action:'crawl_check' with this jobId to get results.` };
+          return {
+            ok: true,
+            jobId: data.result.id,
+            message: `Crawl started for ${params.url}. Use action:'crawl_check' with this jobId to get results.`,
+            browserRun: buildBrowserRunMeta(resp, sessionId),
+          };
         }
 
         // ─── CRAWL CHECK ──────────────────────────────────────────────────
@@ -455,16 +567,28 @@ export function createWebTool(
 
           if (status === "running") {
             const completed = pages?.filter(p => p.status === "completed").length ?? 0;
-            return { ok: true, status: "running", progress: `${completed}/${pages?.length ?? 0} pages completed` };
+            return {
+              ok: true,
+              status: "running",
+              progress: `${completed}/${pages?.length ?? 0} pages completed`,
+              browserRun: buildBrowserRunMeta(resp, sessionId),
+            };
           }
           const completedPages = (pages ?? [])
             .filter(p => p.status === "completed" && p.markdown)
             .map(p => ({ url: p.url, content: (p.markdown ?? "").slice(0, 3000) }));
-          return { ok: true, status, totalPages: pages?.length ?? 0, completedPages: completedPages.length, pages: completedPages.slice(0, 20) };
+          return {
+            ok: true,
+            status,
+            totalPages: pages?.length ?? 0,
+            completedPages: completedPages.length,
+            pages: completedPages.slice(0, 20),
+            browserRun: buildBrowserRunMeta(resp, sessionId),
+          };
         }
 
         default:
-          return { ok: false, error: `Unknown action: ${params.action}. Use: search, read, extract, scrape, links, crawl_start, crawl_check` };
+          return { ok: false, error: `Unknown action: ${params.action}. Use: search, read, extract, scrape, links, crawl_start, crawl_check, diagnostics` };
       }
   }
 }
