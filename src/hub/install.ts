@@ -41,9 +41,9 @@ export async function installSkill(
 
   let result: { ok: boolean; error?: string };
   if (skillExists.length > 0) {
-    result = await editSkill(sql, r2, userId, name, bundle.content, meta);
+    result = await editSkill(sql, r2, userId, name, bundle.content, meta, { skipThreatScan: true });
   } else {
-    result = await createSkill(sql, r2, userId, name, bundle.content, meta);
+    result = await createSkill(sql, r2, userId, name, bundle.content, meta, { skipThreatScan: true });
   }
 
   if (!result.ok) return { ok: false, error: result.error };

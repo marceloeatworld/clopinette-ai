@@ -74,6 +74,10 @@ interface SkillWriteMeta {
   platforms?: string;
 }
 
+interface SkillWriteOptions {
+  skipThreatScan?: boolean;
+}
+
 // ───────────────────────── Read ─────────────────────────
 
 export function listSkills(sql: SqlFn, category?: string, platform?: Platform): SkillMeta[] {
@@ -240,7 +244,8 @@ export async function createSkill(
   userId: string,
   name: string,
   content: string,
-  meta: SkillWriteMeta = {}
+  meta: SkillWriteMeta = {},
+  options: SkillWriteOptions = {},
 ): Promise<SkillWriteResult> {
   if (!name || name.length > 100 || !/[a-zA-Z0-9]/.test(name)) {
     return { ok: false, error: "Skill name must be 1-100 chars and contain at least one alphanumeric character" };
@@ -254,8 +259,10 @@ export async function createSkill(
     return { ok: false, error: "Skill content must include instructions after the frontmatter" };
   }
 
-  const threat = scanForThreats(materialized.content);
-  if (threat) return { ok: false, error: `Blocked: ${threat}` };
+  if (!options.skipThreatScan) {
+    const threat = scanForThreats(materialized.content);
+    if (threat) return { ok: false, error: `Blocked: ${threat}` };
+  }
 
   const persisted = resolveSkillMeta(name, materialized.frontmatter, materialized.body, meta);
   insertSkillRow(sql, persisted);
@@ -270,7 +277,8 @@ export async function editSkill(
   userId: string,
   name: string,
   content: string,
-  meta: SkillWriteMeta = {}
+  meta: SkillWriteMeta = {},
+  options: SkillWriteOptions = {},
 ): Promise<SkillWriteResult> {
   const existing = sql`SELECT name FROM skills WHERE name = ${name}`;
   if (existing.length === 0) return { ok: false, error: `Skill "${name}" not found` };
@@ -280,8 +288,10 @@ export async function editSkill(
     return { ok: false, error: "Skill content must include instructions after the frontmatter" };
   }
 
-  const threat = scanForThreats(materialized.content);
-  if (threat) return { ok: false, error: `Blocked: ${threat}` };
+  if (!options.skipThreatScan) {
+    const threat = scanForThreats(materialized.content);
+    if (threat) return { ok: false, error: `Blocked: ${threat}` };
+  }
 
   const persisted = resolveSkillMeta(name, materialized.frontmatter, materialized.body, meta);
   updateSkillRow(sql, name, persisted);
