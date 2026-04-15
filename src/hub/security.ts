@@ -5,11 +5,14 @@ const MAX_SKILL_CHARS = 200_000;
 
 const CONTROL_CHARS = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/;
 
-const HUB_PATTERNS: Array<{ pattern: RegExp; label: string }> = [
+const STRUCTURAL_PATTERNS: Array<{ pattern: RegExp; label: string }> = [
   { pattern: /\b(?:javascript|data|file|vbscript):/i, label: "dangerous URI scheme" },
   { pattern: /https?:\/\/[^\s]*\.(exe|bat|cmd|ps1|sh)\b/i, label: "links to executable files" },
   { pattern: /<\s*(script|iframe|object|embed|meta|base)\b/i, label: "embedded executable HTML" },
   { pattern: /<!--[\s\S]{0,500}(ignore|system prompt|developer instructions|secret|token)[\s\S]{0,500}-->/i, label: "hidden prompt injection in HTML comment" },
+];
+
+const SEMANTIC_PATTERNS: Array<{ pattern: RegExp; label: string }> = [
   { pattern: /(take|takes)\s+precedence\s+over\s+(system|developer|tool|safety)/i, label: "attempts to override higher-priority instructions" },
   { pattern: /(ignore|bypass|override).{0,120}(developer|system|tool|safety|guardrail)/i, label: "attempts to bypass safeguards" },
   { pattern: /(send|upload|post|exfiltrat|leak|transmit).{0,120}(secret|token|password|credential|api key|environment variable)/i, label: "secret exfiltration instructions" },
@@ -38,16 +41,24 @@ export function scanHubBundle(bundle: HubSkillBundle): string | null {
     },
   ];
 
+  const relaxSemanticScan = bundle.meta.trustLevel === "trusted" || bundle.meta.trustLevel === "builtin";
+
   for (const surface of surfaces) {
     if (!surface.text) continue;
     if (CONTROL_CHARS.test(surface.text)) {
       return `${surface.label} contains disallowed control characters`;
     }
 
+    for (const { pattern, label } of STRUCTURAL_PATTERNS) {
+      if (pattern.test(surface.text)) return `${surface.label}: ${label}`;
+    }
+
+    if (relaxSemanticScan) continue;
+
     const threat = scanForThreats(surface.text);
     if (threat) return `${surface.label}: ${threat}`;
 
-    for (const { pattern, label } of HUB_PATTERNS) {
+    for (const { pattern, label } of SEMANTIC_PATTERNS) {
       if (pattern.test(surface.text)) return `${surface.label}: ${label}`;
     }
   }
