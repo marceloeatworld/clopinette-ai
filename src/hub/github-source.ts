@@ -1,5 +1,6 @@
 import type { SkillSource, HubSkillMeta, HubSkillBundle } from "./types.js";
 import { parseFrontmatter } from "./install.js";
+import { TRUSTED_REPOS } from "./catalog.js";
 
 /**
  * GitHub source — fetch skills from any GitHub repo.
@@ -25,6 +26,27 @@ const CACHE_TTL = 10 * 60 * 1000; // 10 minutes
 
 function humanizeName(name: string): string {
   return name.split(/[-_]/).map(w => w.charAt(0).toUpperCase() + w.slice(1)).join(" ");
+}
+
+function stripBasePath(path: string, basePath: string): string {
+  if (!basePath) return path;
+  const prefix = `${basePath}/`;
+  return path.startsWith(prefix) ? path.slice(prefix.length) : path;
+}
+
+function derivePathTags(skillPath: string): string[] | undefined {
+  const withoutFile = skillPath.replace(/\/SKILL\.md$/, "");
+  const segments = withoutFile.split("/").filter(Boolean);
+  if (segments.length <= 1) return undefined;
+  return segments.slice(0, -1);
+}
+
+function findTrustedRepo(owner: string, repo: string, filePath: string) {
+  return TRUSTED_REPOS.find((candidate) => {
+    if (candidate.owner !== owner || candidate.repo !== repo) return false;
+    if (!candidate.path) return true;
+    return filePath === candidate.path || filePath.startsWith(`${candidate.path}/`);
+  });
 }
 
 export class GitHubSource implements SkillSource {
@@ -82,17 +104,22 @@ export class GitHubSource implements SkillSource {
 
     const content = await resp.text();
     const { frontmatter, body } = parseFrontmatter(content);
+    const trustedRepo = findTrustedRepo(owner, repo, filePath);
+    const relativePath = trustedRepo ? stripBasePath(filePath, trustedRepo.path) : filePath;
+    const inferredTags = derivePathTags(relativePath);
 
     return {
       meta: {
         name: (frontmatter.name as string) || path.split("/").pop() || "unknown",
-        description: (frontmatter.description as string) || "",
+        description: (frontmatter.description as string) || `${humanizeName(relativePath.split("/").slice(-2, -1)[0] || "skill")} — ${trustedRepo?.label ?? `${owner}/${repo}`}`,
         source: "github",
         identifier,
-        trustLevel: "community",
-        author: (frontmatter.author as string) || `${owner}/${repo}`,
+        trustLevel: trustedRepo?.trustLevel ?? "community",
+        author: (frontmatter.author as string) || trustedRepo?.label || `${owner}/${repo}`,
         license: frontmatter.license as string,
-        tags: frontmatter.tags as string[],
+        tags: (frontmatter.tags as string[]) || inferredTags,
+        collection: trustedRepo?.collection,
+        collectionLabel: trustedRepo?.label,
       },
       content: body,
       frontmatter,
@@ -108,8 +135,10 @@ export class GitHubSource implements SkillSource {
     repo: string,
     basePath: string,
     trustLevel: "trusted" | "community" = "community",
+    collection?: string,
+    label?: string,
   ): Promise<HubSkillMeta[]> {
-    const cacheKey = `${owner}/${repo}/${basePath}`;
+    const cacheKey = `${owner}/${repo}/${basePath}/${collection ?? ""}/${label ?? ""}`;
     const cached = repoIndexCache.get(cacheKey);
     if (cached && Date.now() - cached.ts < CACHE_TTL) return cached.skills;
 
@@ -126,26 +155,37 @@ export class GitHubSource implements SkillSource {
     const data = await resp.json<{ tree?: Array<{ path: string; type: string }> }>();
     const prefix = basePath ? `${basePath}/` : "";
 
-    const skills = (data.tree ?? [])
-      .filter(f => f.path.endsWith("/SKILL.md"))
-      .filter(f => {
-        if (prefix && !f.path.startsWith(prefix)) return false;
-        const rel = prefix ? f.path.slice(prefix.length) : f.path;
-        // Only direct children: "name/SKILL.md" (2 segments)
-        const segments = rel.split("/");
-        return segments.length === 2 && !segments[0].startsWith(".");
-      })
-      .map(f => {
-        const rel = prefix ? f.path.slice(prefix.length) : f.path;
-        const name = rel.split("/")[0];
-        return {
-          name,
-          description: `${humanizeName(name)} — ${owner}/${repo}`,
-          source: "github" as const,
-          identifier: `${owner}/${repo}/${f.path}`,
-          trustLevel,
-        };
+    const skills: HubSkillMeta[] = [];
+    for (const entry of data.tree ?? []) {
+      if (!entry.path.endsWith("/SKILL.md")) continue;
+      if (prefix && !entry.path.startsWith(prefix)) continue;
+
+      const rel = prefix ? entry.path.slice(prefix.length) : entry.path;
+      const skillDir = rel.replace(/\/SKILL\.md$/, "");
+      const segments = skillDir.split("/").filter(Boolean);
+      if (segments.length === 0) continue;
+      if (segments.some((segment) => segment.startsWith(".") || segment === "__pycache__")) continue;
+
+      const name = segments[segments.length - 1];
+      const categories = segments.slice(0, -1);
+      const location = categories.length > 0
+        ? ` (${categories.map(humanizeName).join(" / ")})`
+        : "";
+      const collectionLabel = label ?? `${owner}/${repo}`;
+
+      skills.push({
+        name,
+        description: `${humanizeName(name)} — ${collectionLabel}${location}`,
+        source: "github",
+        identifier: `${owner}/${repo}/${entry.path}`,
+        trustLevel,
+        tags: categories.length > 0 ? categories : undefined,
+        collection,
+        collectionLabel,
       });
+    }
+
+    skills.sort((a, b) => a.name.localeCompare(b.name));
 
     repoIndexCache.set(cacheKey, { skills, ts: Date.now() });
     return skills;

@@ -15,7 +15,7 @@ import {
   MAX_STEPS, DEFAULT_AGENT_IDENTITY,
   WHISPER_TOKENS_PER_KB,
 } from "./config/constants.js";
-import { buildSystemPrompt } from "./prompt-builder.js";
+import { buildCurrentContextBlock, buildSystemPrompt } from "./prompt-builder.js";
 import { getHonchoContext } from "./memory/honcho.js";
 import { mirrorMessage, type MirrorVectorCtx } from "./memory/session-search.js";
 import type { LanguageModel } from "ai";
@@ -35,6 +35,7 @@ import { classifyError } from "./inference/error-classifier.js";
 import { redact } from "./enterprise/redact.js";
 import { checkBudget } from "./enterprise/budget.js";
 import { logAudit } from "./enterprise/audit.js";
+import { buildToolSummaryContext } from "./tool-summary.js";
 import {
   runSelfLearningReview,
   buildConversationSummary,
@@ -182,6 +183,34 @@ const TEXT_MIMES = new Set([
   "application/json", "application/xml", "text/xml",
   "application/yaml", "text/yaml",
 ]);
+
+const NO_RESPONSE_FALLBACK = "I couldn't generate a final answer. Please try again.";
+const TOOL_ONLY_RESPONSE_FALLBACK = "I found information but couldn't finish the final reply. Please try again.";
+const STEP_LIMIT_RESPONSE_FALLBACK = "I couldn't finish the answer before reaching the tool budget. Please try again.";
+
+async function synthesizeToolOnlyResponse(
+  model: LanguageModel,
+  userText: string,
+  toolContext: string,
+): Promise<{ text: string; tokensIn: number; tokensOut: number }> {
+  const summaryResult = await generateText({
+    model,
+    system: "You are writing the final assistant reply after tool calls. Answer the user's request directly using the tool results below. Be concise, factual, and natural. If the results are incomplete, state what is known and what remains uncertain. Do not mention internal tools or say that you are summarizing.",
+    messages: [
+      {
+        role: "user" as const,
+        content: `User request: ${userText}\n\nTool results:\n${toolContext}\n\nWrite the final answer you should send to the user now.`,
+      },
+    ],
+    maxRetries: 1,
+  });
+
+  return {
+    text: summaryResult.text?.trim() || "",
+    tokensIn: summaryResult.usage?.inputTokens ?? 0,
+    tokensOut: summaryResult.usage?.outputTokens ?? 0,
+  };
+}
 
 // Telegram often sends .md/.txt/.json as "application/octet-stream"
 // so we also check the file extension
@@ -563,6 +592,7 @@ async function runPipelineInner(
         const preset = PERSONALITIES[personalityRows[0].value];
         if (preset) fastPrompt += `\n\n${preset}`;
       }
+      fastPrompt += `\n\n${buildCurrentContextBlock(ctx.platform)}`;
     }
     mirrorMessage(ctx.sql, ctx.sessionId, "user", ctx.userText, undefined, undefined, buildVectorCtx(ctx));
     ctx.onStateChange?.("streaming");
@@ -599,7 +629,7 @@ async function runPipelineInner(
       messages: fastMessages,
       maxRetries: 1,
     });
-    const text = result.text || "(no response)";
+    const text = result.text?.trim() || NO_RESPONSE_FALLBACK;
     // Use routing.model (AUXILIARY) not config.model (primary) for correct usage attribution
     const fastConfig = { ...config, model: routing.model };
     afterInference(ctx, fastConfig, text, result.usage, auxiliary);
@@ -980,32 +1010,21 @@ async function runPipelineInner(
 
     let text = result.text || "";
 
-    // Budget exhaustion: if we hit step limit with no text, make a final summary call
+    // Tool-only turns can end with empty text if the model calls tools and stops.
+    // Synthesize the final reply explicitly so gateways never get stuck on a placeholder.
     let summaryTokensIn = 0, summaryTokensOut = 0;
-    if (!text && result.steps && result.steps.length >= stepLimit) {
-      console.log("Budget exhausted — making final summary call");
+    const toolContext = buildToolSummaryContext(result.steps);
+    if (!text && toolContext) {
+      const stepLimitReached = !!result.steps && result.steps.length >= stepLimit;
+      console.log(stepLimitReached
+        ? "Budget exhausted — making final summary call"
+        : "Tool-only run returned no final text — synthesizing summary");
       try {
-        // Collect tool results so the summary model has context about what was researched
-        const toolContext = result.steps
-          .flatMap(s => (s.toolResults ?? []).map(r => {
-            const val = typeof r.output === "string" ? r.output : JSON.stringify(r.output);
-            return `[${r.toolName}] ${val.length > 2000 ? val.slice(0, 2000) + "..." : val}`;
-          }))
-          .join("\n\n");
-
-        const summaryResult = await generateText({
-          model,
-          system: "You are a helpful assistant. Provide a concise, direct answer to the user based on the research results below. Speak naturally — no section headers or labels.",
-          // Only pass the current user message (last one) + tool results — no history to avoid context contamination
-          messages: [
-            { role: "user" as const, content: `My question: ${messages.filter(m => m.role === "user").at(-1)?.content ?? ""}\n\nResearch results:\n${toolContext}\n\nAnswer my question based on these results.` },
-          ],
-          maxRetries: 1,
-        });
-        text = summaryResult.text || "(reached step limit)";
+        const summary = await synthesizeToolOnlyResponse(model, ctx.userText, toolContext);
+        text = summary.text || (stepLimitReached ? STEP_LIMIT_RESPONSE_FALLBACK : TOOL_ONLY_RESPONSE_FALLBACK);
         // Track summary tokens separately — they are NOT included in result.usage
-        summaryTokensIn = summaryResult.usage?.inputTokens ?? 0;
-        summaryTokensOut = summaryResult.usage?.outputTokens ?? 0;
+        summaryTokensIn = summary.tokensIn;
+        summaryTokensOut = summary.tokensOut;
         if (summaryTokensIn > 0 || summaryTokensOut > 0) {
           trackAuxiliaryUsage(
             ctx.sql, ctx.sessionId, summaryTokensIn, summaryTokensOut,
@@ -1014,11 +1033,14 @@ async function runPipelineInner(
         }
       } catch (err) {
         console.error("Summary call failed:", err);
-        text = "(reached step limit — could not generate summary)";
+        text = stepLimitReached ? STEP_LIMIT_RESPONSE_FALLBACK : TOOL_ONLY_RESPONSE_FALLBACK;
       }
     }
 
-    if (!text) text = "(no response)";
+    if (!text) {
+      const stepLimitReached = !!result.steps && result.steps.length >= stepLimit;
+      text = stepLimitReached ? STEP_LIMIT_RESPONSE_FALLBACK : NO_RESPONSE_FALLBACK;
+    }
     const usage = result.usage;
     onFinish(text, usage);
 
@@ -1072,7 +1094,7 @@ async function runPipelineInner(
           stopWhen: stepCountIs(MAX_STEPS),
           maxRetries: 1,
         });
-        const text = fbResult.text || "(fallback: no response)";
+        const text = fbResult.text?.trim() || NO_RESPONSE_FALLBACK;
         onFinish(text, fbResult.usage);
 
         const fbMediaDelivery = extractMediaDelivery(fbResult.steps);

@@ -10,6 +10,7 @@ import {
   TELEGRAM_MAX_LENGTH,
 } from "./telegram-format.js";
 import { TelegramProgressController, type TelegramEditResult } from "./telegram-progress.js";
+import { resolveGatewayResponseText } from "./response-text.js";
 
 // ───────────────────────── Types ─────────────────────────
 
@@ -372,24 +373,23 @@ export async function handleTelegramUpdate(
       }
     } else {
       // Edit placeholder with real response (or send new if placeholder failed)
-      if (result.text && result.text !== "(no response)") {
-        const noteKeyboard = {
-          inline_keyboard: [[{ text: "📝", callback_data: "save_note" }]],
-        };
-        let sentMsgId: number | undefined;
-        if (placeholderMsgId && progressController?.editable !== false) {
-          const edited = await editTelegramMessage(botToken, chatId, placeholderMsgId, result.text, noteKeyboard);
-          sentMsgId = edited.ok ? placeholderMsgId : undefined;
-        }
-        // Fallback: send new message if edit failed or no placeholder
-        if (!sentMsgId) {
-          sentMsgId = await sendTelegramMessage(botToken, chatId, result.text, messageId, noteKeyboard);
-        }
-        // Stamp bot message with Telegram message_id for ✍️ reaction-to-note
-        if (sentMsgId) {
-          ctx.sql`UPDATE session_messages SET platform_msg_id = ${sentMsgId}
-            WHERE id = (SELECT id FROM session_messages WHERE session_id = ${ctx.sessionId} AND role = 'assistant' ORDER BY id DESC LIMIT 1)`;
-        }
+      const replyText = resolveGatewayResponseText(result.text);
+      const noteKeyboard = {
+        inline_keyboard: [[{ text: "📝", callback_data: "save_note" }]],
+      };
+      let sentMsgId: number | undefined;
+      if (placeholderMsgId && progressController?.editable !== false) {
+        const edited = await editTelegramMessage(botToken, chatId, placeholderMsgId, replyText, noteKeyboard);
+        sentMsgId = edited.ok ? placeholderMsgId : undefined;
+      }
+      // Fallback: send new message if edit failed or no placeholder
+      if (!sentMsgId) {
+        sentMsgId = await sendTelegramMessage(botToken, chatId, replyText, messageId, noteKeyboard);
+      }
+      // Stamp bot message with Telegram message_id for ✍️ reaction-to-note
+      if (sentMsgId) {
+        ctx.sql`UPDATE session_messages SET platform_msg_id = ${sentMsgId}
+          WHERE id = (SELECT id FROM session_messages WHERE session_id = ${ctx.sessionId} AND role = 'assistant' ORDER BY id DESC LIMIT 1)`;
       }
 
       // Deliver generated media (TTS audio, images)

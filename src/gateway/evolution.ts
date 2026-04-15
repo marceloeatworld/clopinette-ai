@@ -13,6 +13,7 @@ import type { SqlFn } from "../config/sql.js";
 import type { MediaAsset } from "../config/types.js";
 import type { MediaDelivery } from "../pipeline.js";
 import { handleCommand } from "../commands.js";
+import { resolveGatewayResponseText } from "./response-text.js";
 
 // ───────────────────────── Types ─────────────────────────
 
@@ -160,9 +161,13 @@ export async function handleEvolutionUpdate(
     if ("error" in result) {
       await sendEvolutionMessage(ctx.apiUrl, ctx.apiKey, ctx.instanceName, remoteJid, `Error: ${result.error}`);
     } else {
-      if (result.text && result.text !== "(no response)") {
-        await sendEvolutionMessage(ctx.apiUrl, ctx.apiKey, ctx.instanceName, remoteJid, result.text);
-      }
+      await sendEvolutionMessage(
+        ctx.apiUrl,
+        ctx.apiKey,
+        ctx.instanceName,
+        remoteJid,
+        resolveGatewayResponseText(result.text),
+      );
       if (result.mediaDelivery?.length) {
         for (const media of result.mediaDelivery) {
           try {

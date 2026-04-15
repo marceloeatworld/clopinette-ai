@@ -12,6 +12,7 @@ import { handleWhatsAppUpdate } from "./gateway/whatsapp.js";
 import { handleDiscordInteraction, handleDiscordMessage, processInteractionDeferred, sendDiscordMessage } from "./gateway/discord.js";
 import type { DiscordInteraction, DiscordBridgePayload } from "./gateway/discord.js";
 import { runPipeline } from "./pipeline.js";
+import { canReuseCachedSystemPrompt, getPromptCacheDay } from "./prompt-cache.js";
 import { getSessionMessages } from "./memory/session-search.js";
 import { getPromptMemory } from "./memory/prompt-memory.js";
 import { handleCommand } from "./commands.js";
@@ -65,6 +66,8 @@ export class ClopinetteAgent extends AIChatAgent<Env, AgentState> {
   #sharedMode = false;
   /** Cached system prompt — invalidated on config change or code deploy. */
   #cachedSystemPrompt: string | null = null;
+  /** UTC day for which the cached system prompt was built. */
+  #cachedSystemPromptDay: string | null = null;
   /** Cached inference config — invalidated on config change. */
   #cachedInferenceConfig: InferenceConfig | null = null;
   /** Prompt version — bump on deploys that change the system prompt. */
@@ -81,6 +84,21 @@ export class ClopinetteAgent extends AIChatAgent<Env, AgentState> {
     resolve: (result: import("./pipeline.js").ElicitResult) => void;
     timer: ReturnType<typeof setTimeout>;
   }>();
+
+  #getCachedSystemPrompt(): string | null {
+    return canReuseCachedSystemPrompt(
+      this.#cachedSystemPrompt,
+      this.#cachedSystemPromptDay,
+      this.#promptVersion,
+      ClopinetteAgent.PROMPT_VERSION,
+    ) ? this.#cachedSystemPrompt : null;
+  }
+
+  #cacheSystemPrompt(prompt: string): void {
+    this.#cachedSystemPrompt = prompt;
+    this.#cachedSystemPromptDay = getPromptCacheDay();
+    this.#promptVersion = ClopinetteAgent.PROMPT_VERSION;
+  }
 
   // ───────────────────────── Lifecycle ─────────────────────────
 
@@ -493,9 +511,9 @@ export class ClopinetteAgent extends AIChatAgent<Env, AgentState> {
         enableCompression: true,
         enableSelfLearning: true,
         recentToolUse: recentToolUse ? 1 : 0,
-        cachedSystemPrompt: this.#promptVersion === ClopinetteAgent.PROMPT_VERSION ? this.#cachedSystemPrompt : null,
+        cachedSystemPrompt: this.#getCachedSystemPrompt(),
         cachedInferenceConfig: this.#cachedInferenceConfig,
-        onCacheSystemPrompt: (p) => { this.#cachedSystemPrompt = p; this.#promptVersion = ClopinetteAgent.PROMPT_VERSION; },
+        onCacheSystemPrompt: (p) => { this.#cacheSystemPrompt(p); },
         onCacheInferenceConfig: (c) => { this.#cachedInferenceConfig = c; },
         onStateChange: (status) => {
           this.setState({
@@ -652,9 +670,9 @@ export class ClopinetteAgent extends AIChatAgent<Env, AgentState> {
         enableCompression: false,
         enableSelfLearning: !this.#sharedMode,
         sharedMode: this.#sharedMode,
-        cachedSystemPrompt: this.#promptVersion === ClopinetteAgent.PROMPT_VERSION ? this.#cachedSystemPrompt : null,
+        cachedSystemPrompt: this.#getCachedSystemPrompt(),
         cachedInferenceConfig: this.#cachedInferenceConfig,
-        onCacheSystemPrompt: (p) => { this.#cachedSystemPrompt = p; this.#promptVersion = ClopinetteAgent.PROMPT_VERSION; },
+        onCacheSystemPrompt: (p) => { this.#cacheSystemPrompt(p); },
         onCacheInferenceConfig: (c) => { this.#cachedInferenceConfig = c; },
         onStateChange: (status) => {
           this.setState({ ...this.state, status });
@@ -988,20 +1006,32 @@ export class ClopinetteAgent extends AIChatAgent<Env, AgentState> {
     // Set GitHub token for authenticated API calls (5000 req/h vs 60)
     const { GitHubSource } = await import("./hub/github-source.js");
     GitHubSource.setToken(this.env.GITHUB_TOKEN);
+    const { TRUSTED_REPOS } = await import("./hub/catalog.js");
+    const selectedTrustedRepos = source && source !== "github"
+      ? TRUSTED_REPOS.filter((repo) => repo.id === source || repo.collection === source)
+      : TRUSTED_REPOS;
 
     if (!source || source === "catalog") {
       const { searchCatalog } = await import("./hub/catalog.js");
       results.push(...searchCatalog(query, limit));
     }
 
-    if (!source || source === "github") {
-      const { TRUSTED_REPOS } = await import("./hub/catalog.js");
+    if (!source || source === "github" || selectedTrustedRepos.length > 0) {
       const { GitHubSource } = await import("./hub/github-source.js");
       const gh = new GitHubSource();
 
       // Index trusted repos (cached, 1 API call per repo)
       const repoResults = await Promise.all(
-        TRUSTED_REPOS.map(r => gh.listRepoSkills(r.owner, r.repo, r.path, r.trustLevel))
+        selectedTrustedRepos.map((repo) =>
+          gh.listRepoSkills(
+            repo.owner,
+            repo.repo,
+            repo.path,
+            repo.trustLevel,
+            repo.collection,
+            repo.label,
+          ),
+        )
       );
       const allRepoSkills = repoResults.flat();
 
@@ -1009,10 +1039,14 @@ export class ClopinetteAgent extends AIChatAgent<Env, AgentState> {
         const q = query.toLowerCase();
         results.push(...allRepoSkills.filter(s =>
           s.name.toLowerCase().includes(q) ||
-          s.description.toLowerCase().includes(q)
+          s.description.toLowerCase().includes(q) ||
+          s.tags?.some((tag) => tag.toLowerCase().includes(q)) ||
+          s.collectionLabel?.toLowerCase().includes(q)
         ));
         // Also search broader GitHub
-        results.push(...await gh.search(query, limit));
+        if (!source || source === "github") {
+          results.push(...await gh.search(query, limit));
+        }
       } else {
         results.push(...allRepoSkills);
       }
@@ -1042,6 +1076,7 @@ export class ClopinetteAgent extends AIChatAgent<Env, AgentState> {
       }
     } else if (source === "github") {
       const { GitHubSource } = await import("./hub/github-source.js");
+      GitHubSource.setToken(this.env.GITHUB_TOKEN);
       bundle = await new GitHubSource().fetch(identifier);
     } else if (source === "url") {
       const { URLSource } = await import("./hub/url-source.js");

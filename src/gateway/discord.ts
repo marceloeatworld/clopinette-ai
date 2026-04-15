@@ -23,6 +23,7 @@ import type { MediaDelivery } from "../pipeline.js";
 import { downloadAndStore } from "../media/handler.js";
 import { handleCommand } from "../commands.js";
 import { DiscordProgressController, type DiscordEditResult } from "./discord-progress.js";
+import { resolveGatewayResponseText } from "./response-text.js";
 
 const DISCORD_API = "https://discord.com/api/v10";
 const MAX_LENGTH = 2000;
@@ -267,7 +268,11 @@ export async function processInteractionDeferred(
     if ("error" in result) {
       await editOriginalResponse(ctx.applicationId, interaction.token, `Error: ${result.error}`);
     } else {
-      await editOriginalResponse(ctx.applicationId, interaction.token, result.text || "(no response)");
+      await editOriginalResponse(
+        ctx.applicationId,
+        interaction.token,
+        resolveGatewayResponseText(result.text),
+      );
       // Deliver media
       if (result.mediaDelivery?.length && interaction.channel_id) {
         await deliverMedia(ctx, interaction.channel_id, result.mediaDelivery);
@@ -292,8 +297,8 @@ export async function processInteractionDeferred(
     // Rewrite mode (e.g. /research) — run the rewritten prompt through the pipeline
     // and edit the original deferred response with the synthesized answer.
     const result = await ctx.runPrompt(sharedResult.rewriteAs, undefined, undefined, interaction.channel_id);
-    const reply = "error" in result ? `Error: ${result.error}` : result.text;
-    await editOriginalResponse(ctx.applicationId, interaction.token, reply || "Done.");
+    const reply = "error" in result ? `Error: ${result.error}` : resolveGatewayResponseText(result.text);
+    await editOriginalResponse(ctx.applicationId, interaction.token, reply);
     return;
   }
 
@@ -417,15 +422,14 @@ export async function handleDiscordMessage(
         await sendDiscordMessage(ctx.botToken, channelId, `Error: ${result.error}`);
       }
     } else {
-      if (result.text && result.text !== "(no response)") {
-        if (placeholderMsgId) {
-          const sentMsgId = await replaceDiscordPlaceholder(ctx.botToken, channelId, placeholderMsgId, result.text);
-          if (!sentMsgId) {
-            await sendDiscordMessage(ctx.botToken, channelId, result.text);
-          }
-        } else {
-          await sendDiscordMessage(ctx.botToken, channelId, result.text);
+      const replyText = resolveGatewayResponseText(result.text);
+      if (placeholderMsgId) {
+        const sentMsgId = await replaceDiscordPlaceholder(ctx.botToken, channelId, placeholderMsgId, replyText);
+        if (!sentMsgId) {
+          await sendDiscordMessage(ctx.botToken, channelId, replyText);
         }
+      } else {
+        await sendDiscordMessage(ctx.botToken, channelId, replyText);
       }
 
       // Deliver generated media

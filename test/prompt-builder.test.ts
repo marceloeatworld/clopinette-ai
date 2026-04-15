@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { buildSystemPrompt } from "../src/prompt-builder.js";
+import { buildCurrentContextBlock, buildSystemPrompt, getCurrentPromptDate } from "../src/prompt-builder.js";
 
 // Mock SQL function that returns empty for all queries
 function mockSql<T>(_strings: TemplateStringsArray, ..._values: unknown[]): T[] {
@@ -73,5 +73,13 @@ describe("prompt builder", () => {
 
     expect(prompt).toContain("Context (Honcho)");
     expect(prompt).toContain("concise responses");
+  });
+
+  it("formats the current context block with a stable date", () => {
+    const now = new Date("2026-04-15T12:34:56.000Z");
+    expect(getCurrentPromptDate(now)).toBe("2026-04-15");
+    expect(buildCurrentContextBlock("discord", now)).toBe(
+      "## Current Context\nDate: 2026-04-15\nPlatform: discord",
+    );
   });
 });

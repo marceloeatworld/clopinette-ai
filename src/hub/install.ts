@@ -3,6 +3,7 @@ import type { HubSkillBundle, HubInstallResult } from "./types.js";
 import type { HubInstalledEntry } from "../config/types.js";
 import { createSkill, editSkill } from "../memory/skills.js";
 import { logAudit } from "../enterprise/audit.js";
+import { scanHubBundle } from "./security.js";
 
 /**
  * Install a skill from the hub into the user's agent.
@@ -16,8 +17,7 @@ export async function installSkill(
   userId: string,
   bundle: HubSkillBundle
 ): Promise<HubInstallResult> {
-  // Hub-specific security scan (scanForThreats is already called inside createSkill/editSkill)
-  const hubThreat = scanHubContent(bundle.content);
+  const hubThreat = scanHubBundle(bundle);
   if (hubThreat) {
     return { ok: false, error: `Blocked by hub security: ${hubThreat}` };
   }
@@ -54,6 +54,8 @@ export async function installSkill(
     author: bundle.meta.author,
     license: bundle.meta.license,
     tags: bundle.meta.tags,
+    collection: bundle.meta.collection,
+    collectionLabel: bundle.meta.collectionLabel,
   });
 
   if (existing.length > 0) {
@@ -126,42 +128,39 @@ export function parseFrontmatter(content: string): {
 
   // Simple YAML parser (key: value, one per line)
   const frontmatter: Record<string, unknown> = {};
-  for (const line of yamlBlock.split("\n")) {
-    const kv = line.match(/^(\w[\w-]*)\s*:\s*(.+)$/);
-    if (kv) {
-      const [, key, value] = kv;
-      // Handle arrays: [item1, item2]
-      if (value.startsWith("[") && value.endsWith("]")) {
-        frontmatter[key] = value.slice(1, -1).split(",").map(s => s.trim());
-      } else {
-        frontmatter[key] = value.trim();
+  const lines = yamlBlock.split("\n");
+  for (let i = 0; i < lines.length; i++) {
+    const kv = lines[i].match(/^(\w[\w-]*)\s*:\s*(.*)$/);
+    if (!kv) continue;
+
+    const [, key, rawValue] = kv;
+    const value = rawValue.trim();
+
+    if (!value) {
+      const items: string[] = [];
+      let j = i + 1;
+      while (j < lines.length && !/^\w[\w-]*\s*:/.test(lines[j])) {
+        const listItem = lines[j].match(/^\s*-\s*(.+?)\s*$/);
+        if (listItem) items.push(unquoteYaml(listItem[1]));
+        j++;
       }
+      if (items.length > 0) frontmatter[key] = items;
+      i = j - 1;
+      continue;
+    }
+
+    if (value.startsWith("[") && value.endsWith("]")) {
+      frontmatter[key] = value.slice(1, -1).split(",").map(s => unquoteYaml(s.trim())).filter(Boolean);
+    } else {
+      frontmatter[key] = unquoteYaml(value);
     }
   }
 
   return { frontmatter, body };
 }
 
-// ───────────────────────── Hub-specific security ─────────────────────────
-
-/**
- * Extended security scan for hub-installed skills.
- * Checks for patterns that are dangerous in skill instructions.
- */
-function scanHubContent(content: string): string | null {
-  const patterns: Array<{ pattern: RegExp; label: string }> = [
-    { pattern: /override\s+(the\s+)?system/i, label: "attempts to override system prompt" },
-    { pattern: /forget\s+(all|everything|your)/i, label: "attempts to reset agent memory" },
-    { pattern: /new\s+instructions?\s*:/i, label: "attempts to inject new instructions" },
-    { pattern: /https?:\/\/[^\s]*\.(exe|bat|sh|ps1|cmd)\b/i, label: "links to executable files" },
-    { pattern: /eval\s*\(|Function\s*\(/i, label: "contains code execution patterns" },
-  ];
-
-  for (const { pattern, label } of patterns) {
-    if (pattern.test(content)) return label;
-  }
-
-  return null;
+function unquoteYaml(value: string): string {
+  return value.replace(/^['"]|['"]$/g, "").trim();
 }
 
 // ───────────────────────── Daily Update Check ─────────────────────────

@@ -8,9 +8,11 @@ import type { HubSkillMeta, CatalogIndex, TrustedRepo } from "./types.js";
 // ───────────────────────── Trusted GitHub Repos ─────────────────────────
 
 export const TRUSTED_REPOS: TrustedRepo[] = [
-  { owner: "MiniMax-AI", repo: "skills", path: "skills", trustLevel: "trusted", label: "MiniMax AI" },
-  { owner: "garrytan", repo: "gstack", path: "", trustLevel: "trusted", label: "gstack" },
-  { owner: "cloudflare", repo: "skills", path: "skills", trustLevel: "trusted", label: "Cloudflare" },
+  { id: "minimax", collection: "minimax", owner: "MiniMax-AI", repo: "skills", path: "skills", trustLevel: "trusted", label: "MiniMax AI" },
+  { id: "gstack", collection: "gstack", owner: "garrytan", repo: "gstack", path: "", trustLevel: "trusted", label: "gstack" },
+  { id: "cloudflare", collection: "cloudflare", owner: "cloudflare", repo: "skills", path: "skills", trustLevel: "trusted", label: "Cloudflare" },
+  { id: "hermes", collection: "hermes", owner: "NousResearch", repo: "hermes-agent", path: "skills", trustLevel: "trusted", label: "Hermes Agent" },
+  { id: "hermes-optional", collection: "hermes", owner: "NousResearch", repo: "hermes-agent", path: "optional-skills", trustLevel: "trusted", label: "Hermes Agent Optional" },
 ];
 
 // ───────────────────────── Built-in Catalog (inline content) ─────────────────────────
@@ -129,9 +131,9 @@ export function searchCatalog(query: string, limit = 10): HubSkillMeta[] {
   const q = query.toLowerCase();
   return BUILT_IN_CATALOG.skills
     .filter(s =>
-      s.name.includes(q) ||
+      s.name.toLowerCase().includes(q) ||
       s.description.toLowerCase().includes(q) ||
-      s.tags?.some(t => t.includes(q))
+      s.tags?.some(t => t.toLowerCase().includes(q))
     )
     .slice(0, limit)
     .map(s => ({

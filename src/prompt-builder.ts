@@ -35,6 +35,14 @@ export interface PromptContext {
   modelId?: string;
 }
 
+export function getCurrentPromptDate(now: Date = new Date()): string {
+  return now.toISOString().split("T")[0];
+}
+
+export function buildCurrentContextBlock(platform: Platform, now: Date = new Date()): string {
+  return `## Current Context\nDate: ${getCurrentPromptDate(now)}\nPlatform: ${platform}`;
+}
+
 /**
  * Detect which model family the active model belongs to. The substrings are
  * the same ones hermes uses, plus a few clopinette-specific aliases.
@@ -145,10 +153,7 @@ export async function buildSystemPrompt(ctx: PromptContext): Promise<string> {
   }
 
   // [9] Date + metadata (date-only, no timestamp — keeps prompt identical across turns for prefix caching)
-  const today = new Date().toISOString().split("T")[0]; // YYYY-MM-DD
-  blocks.push(
-    `## Current Context\nDate: ${today}\nPlatform: ${ctx.platform}`
-  );
+  blocks.push(buildCurrentContextBlock(ctx.platform));
 
   // [10] Behavioral rules — cross-cutting guidance only (tool descriptions are authoritative).
   blocks.push(

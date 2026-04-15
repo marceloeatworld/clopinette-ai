@@ -11,6 +11,8 @@ export interface HubSkillMeta {
   tags?: string[];
   author?: string;
   license?: string;
+  collection?: string;
+  collectionLabel?: string;
 }
 
 export interface HubSkillBundle {
@@ -48,6 +50,8 @@ export interface CatalogIndex {
 }
 
 export interface TrustedRepo {
+  id: string;
+  collection: string;
   owner: string;
   repo: string;
   path: string;

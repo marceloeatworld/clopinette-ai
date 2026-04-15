@@ -28,6 +28,7 @@ import type { SqlFn } from "../config/sql.js";
 import type { MediaAsset } from "../config/types.js";
 import type { MediaDelivery } from "../pipeline.js";
 import { handleCommand } from "../commands.js";
+import { resolveGatewayResponseText } from "./response-text.js";
 
 // ───────────────────────── Types ─────────────────────────
 
@@ -192,10 +193,12 @@ export async function handleWhatsAppUpdate(
     if ("error" in result) {
       await sendWhatsAppMessage(ctx.accessToken, ctx.phoneNumberId, from, `Error: ${result.error}`);
     } else {
-      // Send text response
-      if (result.text && result.text !== "(no response)") {
-        await sendWhatsAppMessage(ctx.accessToken, ctx.phoneNumberId, from, result.text);
-      }
+      await sendWhatsAppMessage(
+        ctx.accessToken,
+        ctx.phoneNumberId,
+        from,
+        resolveGatewayResponseText(result.text),
+      );
 
       // Deliver generated media (TTS audio, images)
       if (result.mediaDelivery?.length) {
