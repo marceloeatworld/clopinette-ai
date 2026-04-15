@@ -28,6 +28,12 @@ function humanizeName(name: string): string {
   return name.split(/[-_]/).map(w => w.charAt(0).toUpperCase() + w.slice(1)).join(" ");
 }
 
+function inferSkillNameFromPath(path: string): string {
+  const withoutFile = path.replace(/\/SKILL\.md$/i, "");
+  const segments = withoutFile.split("/").filter(Boolean);
+  return segments[segments.length - 1] || path;
+}
+
 function stripBasePath(path: string, basePath: string): string {
   if (!basePath) return path;
   const prefix = `${basePath}/`;
@@ -110,8 +116,8 @@ export class GitHubSource implements SkillSource {
 
     return {
       meta: {
-        name: (frontmatter.name as string) || path.split("/").pop() || "unknown",
-        description: (frontmatter.description as string) || `${humanizeName(relativePath.split("/").slice(-2, -1)[0] || "skill")} — ${trustedRepo?.label ?? `${owner}/${repo}`}`,
+        name: (frontmatter.name as string) || inferSkillNameFromPath(path) || "unknown",
+        description: (frontmatter.description as string) || `${humanizeName(inferSkillNameFromPath(relativePath) || "skill")} — ${trustedRepo?.label ?? `${owner}/${repo}`}`,
         source: "github",
         identifier,
         trustLevel: trustedRepo?.trustLevel ?? "community",

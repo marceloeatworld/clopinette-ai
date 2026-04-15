@@ -44,4 +44,33 @@ describe("hub github source", () => {
       tags: ["mlops", "training"],
     });
   });
+
+  it("fetches a GitHub skill using the directory name when frontmatter has no name", async () => {
+    globalThis.fetch = vi.fn(async (input) => {
+      const url = String(input);
+      if (url.includes("/contents/")) {
+        return new Response(`---
+description: Test skill without explicit name
+---
+
+# Hello
+
+Content`, {
+          status: 200,
+          headers: { "Content-Type": "text/plain" },
+        });
+      }
+      throw new Error(`Unexpected fetch: ${url}`);
+    }) as typeof fetch;
+
+    const gh = new GitHubSource();
+    const bundle = await gh.fetch("NousResearch/hermes-agent/skills/apple/apple-notes/SKILL.md");
+
+    expect(bundle).not.toBeNull();
+    expect(bundle?.meta).toMatchObject({
+      name: "apple-notes",
+      description: "Test skill without explicit name",
+      source: "github",
+    });
+  });
 });
