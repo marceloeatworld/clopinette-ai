@@ -40,10 +40,16 @@ export interface SkillMeta {
   updatedAt: string;
 }
 
+export interface SkillSupportFile {
+  path: string;
+  content: string;
+}
+
 export interface SkillFull extends SkillMeta {
   content: string;
   body: string;
   frontmatter: SkillFrontmatter;
+  supportFiles: SkillSupportFile[];
 }
 
 interface ParsedSkillDocument {
@@ -117,6 +123,7 @@ export async function getSkill(
   const obj = await r2.get(r2SkillPath(userId, name));
   const content = obj ? await obj.text() : "";
   const parsed = parseSkillDocument(content);
+  const supportFiles = await getSkillSupportFiles(r2, userId, name);
 
   return {
     ...rows[0],
@@ -130,7 +137,57 @@ export async function getSkill(
       triggerPattern: rows[0].triggerPattern ?? parsed.frontmatter.triggerPattern,
       platforms: normalizePlatforms(rows[0].platforms ?? parsed.frontmatter.platforms),
     },
+    supportFiles,
   };
+}
+
+export async function getSkillSupportFiles(
+  r2: R2Bucket,
+  userId: string,
+  name: string,
+): Promise<SkillSupportFile[]> {
+  const prefix = r2SkillSupportPrefix(userId, name);
+  const listed = await r2.list({ prefix, limit: 1000 });
+  if (listed.objects.length === 0) return [];
+
+  const files = await Promise.all(listed.objects
+    .map(async (object) => {
+      const obj = await r2.get(object.key);
+      if (!obj) return null;
+      return {
+        path: object.key.slice(prefix.length),
+        content: await obj.text(),
+      } satisfies SkillSupportFile;
+    }));
+
+  return files.filter((file): file is SkillSupportFile => file !== null)
+    .sort((a, b) => a.path.localeCompare(b.path));
+}
+
+export async function replaceSkillSupportFiles(
+  r2: R2Bucket,
+  userId: string,
+  name: string,
+  files: SkillSupportFile[],
+): Promise<void> {
+  const prefix = r2SkillSupportPrefix(userId, name);
+  const listed = await r2.list({ prefix, limit: 1000 });
+  const nextKeys = new Set<string>();
+
+  for (const file of files) {
+    const safePath = normalizeSupportFilePath(file.path);
+    if (!safePath) continue;
+    const key = `${prefix}${safePath}`;
+    nextKeys.add(key);
+    await r2.put(key, file.content);
+  }
+
+  const staleKeys = listed.objects
+    .map((object) => object.key)
+    .filter((key) => !nextKeys.has(key));
+  if (staleKeys.length > 0) {
+    await r2.delete(staleKeys);
+  }
 }
 
 /**
@@ -272,6 +329,11 @@ export async function deleteSkill(
 
   sql`DELETE FROM skills WHERE name = ${name}`;
   await r2.delete(r2SkillPath(userId, name));
+  const supportPrefix = r2SkillSupportPrefix(userId, name);
+  const listed = await r2.list({ prefix: supportPrefix, limit: 1000 });
+  if (listed.objects.length > 0) {
+    await r2.delete(listed.objects.map((object) => object.key));
+  }
   return { ok: true };
 }
 
@@ -315,6 +377,21 @@ function r2SkillPath(userId: string, name: string): string {
   const safeUserId = userId.replace(/[^a-zA-Z0-9_-]/g, "");
   const safeName = name.replace(/[^a-zA-Z0-9_-]/g, "");
   return `${safeUserId}/skills/${safeName}.md`;
+}
+
+function r2SkillSupportPrefix(userId: string, name: string): string {
+  const safeUserId = userId.replace(/[^a-zA-Z0-9_-]/g, "");
+  const safeName = name.replace(/[^a-zA-Z0-9_-]/g, "");
+  return `${safeUserId}/skills/${safeName}/support/`;
+}
+
+function normalizeSupportFilePath(path: string): string | null {
+  const trimmed = path.trim().replace(/^\/+/, "");
+  if (!trimmed) return null;
+  const segments = trimmed.split("/").filter(Boolean);
+  if (segments.length === 0) return null;
+  if (segments.some((segment) => segment === "." || segment === "..")) return null;
+  return segments.join("/");
 }
 
 function parseSkillDocument(content: string): ParsedSkillDocument {

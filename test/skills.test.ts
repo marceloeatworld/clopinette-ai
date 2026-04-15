@@ -3,6 +3,7 @@ import {
   createSkill,
   getSkill,
   getSkillsIndex,
+  replaceSkillSupportFiles,
 } from "../src/memory/skills.js";
 
 import type { SqlFn } from "../src/config/sql.js";
@@ -115,6 +116,13 @@ class FakeR2Bucket {
   async delete(key: string) {
     this.store.delete(key);
   }
+
+  async list({ prefix }: { prefix: string }) {
+    const objects = Array.from(this.store.keys())
+      .filter((key) => key.startsWith(prefix))
+      .map((key) => ({ key }));
+    return { objects };
+  }
 }
 
 describe("skills memory store", () => {
@@ -192,5 +200,34 @@ describe("skills memory store", () => {
     expect(index).toContain("### research");
     expect(index).toContain("arxiv-helper");
     expect(index).not.toContain("telegram-mod-helper");
+  });
+
+  it("loads support files stored alongside the skill", async () => {
+    const sql = createFakeSql();
+    const r2 = new FakeR2Bucket();
+
+    await createSkill(
+      sql,
+      r2 as unknown as R2Bucket,
+      "user-1",
+      "godmode",
+      "# Godmode\n\nUse the support scripts when needed.",
+      { category: "security" },
+    );
+    await replaceSkillSupportFiles(
+      r2 as unknown as R2Bucket,
+      "user-1",
+      "godmode",
+      [
+        { path: "scripts/parseltongue.py", content: "print('hello')" },
+        { path: "references/templates.md", content: "# Templates" },
+      ],
+    );
+
+    const skill = await getSkill(sql, r2 as unknown as R2Bucket, "user-1", "godmode");
+    expect(skill?.supportFiles).toEqual([
+      { path: "references/templates.md", content: "# Templates" },
+      { path: "scripts/parseltongue.py", content: "print('hello')" },
+    ]);
   });
 });

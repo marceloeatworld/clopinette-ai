@@ -1,4 +1,4 @@
-import type { SkillSource, HubSkillMeta, HubSkillBundle } from "./types.js";
+import type { SkillSource, HubSkillMeta, HubSkillBundle, HubSupportFile } from "./types.js";
 import { parseFrontmatter } from "./install.js";
 import { TRUSTED_REPOS } from "./catalog.js";
 
@@ -23,6 +23,10 @@ let _githubToken: string | undefined;
 // In-memory cache for repo indexes (persists for DO lifetime)
 const repoIndexCache = new Map<string, { skills: HubSkillMeta[]; ts: number }>();
 const CACHE_TTL = 10 * 60 * 1000; // 10 minutes
+const MAX_SUPPORT_FILES = 24;
+const MAX_SUPPORT_FILE_CHARS = 120_000;
+const MAX_SUPPORT_TOTAL_CHARS = 500_000;
+const TEXT_SUPPORT_EXTENSIONS = /\.(md|txt|json|ya?ml|toml|py|sh|bash|zsh|js|ts|tsx|jsx|mjs|cjs|rb|go|rs|java|kt|swift|sql|cfg|ini)$/i;
 
 function humanizeName(name: string): string {
   return name.split(/[-_]/).map(w => w.charAt(0).toUpperCase() + w.slice(1)).join(" ");
@@ -32,6 +36,10 @@ function inferSkillNameFromPath(path: string): string {
   const withoutFile = path.replace(/\/SKILL\.md$/i, "");
   const segments = withoutFile.split("/").filter(Boolean);
   return segments[segments.length - 1] || path;
+}
+
+function isTextSupportFile(path: string): boolean {
+  return TEXT_SUPPORT_EXTENSIONS.test(path);
 }
 
 function stripBasePath(path: string, basePath: string): string {
@@ -113,6 +121,8 @@ export class GitHubSource implements SkillSource {
     const trustedRepo = findTrustedRepo(owner, repo, filePath);
     const relativePath = trustedRepo ? stripBasePath(filePath, trustedRepo.path) : filePath;
     const inferredTags = derivePathTags(relativePath);
+    const skillDir = filePath.replace(/\/SKILL\.md$/i, "");
+    const supportFiles = await this.fetchSupportFiles(owner, repo, skillDir);
 
     return {
       meta: {
@@ -129,7 +139,49 @@ export class GitHubSource implements SkillSource {
       },
       content: body,
       frontmatter,
+      supportFiles,
     };
+  }
+
+  async fetchSupportFiles(owner: string, repo: string, skillDir: string): Promise<HubSupportFile[]> {
+    const resp = await fetch(`${GITHUB_API}/repos/${owner}/${repo}/git/trees/main?recursive=1`, {
+      headers: githubHeaders(_githubToken),
+    });
+    if (!resp.ok) return [];
+
+    const data = await resp.json<{ tree?: Array<{ path: string; type: string; size?: number }> }>();
+    const prefix = `${skillDir}/`;
+    const candidates = (data.tree ?? [])
+      .filter((entry) =>
+        entry.type === "blob"
+        && entry.path.startsWith(prefix)
+        && !entry.path.endsWith("/SKILL.md")
+        && isTextSupportFile(entry.path))
+      .slice(0, MAX_SUPPORT_FILES);
+
+    const files: HubSupportFile[] = [];
+    let totalChars = 0;
+
+    for (const entry of candidates) {
+      const rawResp = await fetch(`${GITHUB_API}/repos/${owner}/${repo}/contents/${entry.path}`, {
+        headers: { ...githubHeaders(_githubToken), Accept: "application/vnd.github.v3.raw" },
+      });
+      if (!rawResp.ok) continue;
+
+      const content = await rawResp.text();
+      const capped = content.length > MAX_SUPPORT_FILE_CHARS
+        ? `${content.slice(0, MAX_SUPPORT_FILE_CHARS)}\n[...truncated]`
+        : content;
+      if (totalChars + capped.length > MAX_SUPPORT_TOTAL_CHARS) break;
+
+      totalChars += capped.length;
+      files.push({
+        path: entry.path.slice(prefix.length),
+        content: capped,
+      });
+    }
+
+    return files.sort((a, b) => a.path.localeCompare(b.path));
   }
 
   /**

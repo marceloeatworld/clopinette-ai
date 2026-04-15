@@ -48,6 +48,16 @@ describe("hub github source", () => {
   it("fetches a GitHub skill using the directory name when frontmatter has no name", async () => {
     globalThis.fetch = vi.fn(async (input) => {
       const url = String(input);
+      if (url.includes("/git/trees/main?recursive=1")) {
+        return new Response(JSON.stringify({
+          tree: [
+            { path: "skills/apple/apple-notes/SKILL.md", type: "blob" },
+          ],
+        }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
       if (url.includes("/contents/")) {
         return new Response(`---
 description: Test skill without explicit name
@@ -72,5 +82,43 @@ Content`, {
       description: "Test skill without explicit name",
       source: "github",
     });
+    expect(bundle?.supportFiles).toEqual([]);
+  });
+
+  it("fetches text support files that live next to the skill", async () => {
+    globalThis.fetch = vi.fn(async (input) => {
+      const url = String(input);
+      if (url.includes("/git/trees/main?recursive=1")) {
+        return new Response(JSON.stringify({
+          tree: [
+            { path: "skills/red-teaming/godmode/SKILL.md", type: "blob" },
+            { path: "skills/red-teaming/godmode/scripts/parseltongue.py", type: "blob" },
+            { path: "skills/red-teaming/godmode/templates/prefill.json", type: "blob" },
+            { path: "skills/red-teaming/godmode/image.png", type: "blob" },
+          ],
+        }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+      if (url.includes("/contents/skills/red-teaming/godmode/SKILL.md")) {
+        return new Response("---\nname: godmode\n---\n\n# Godmode", { status: 200 });
+      }
+      if (url.includes("/contents/skills/red-teaming/godmode/scripts/parseltongue.py")) {
+        return new Response("print('parseltongue')", { status: 200 });
+      }
+      if (url.includes("/contents/skills/red-teaming/godmode/templates/prefill.json")) {
+        return new Response("{\"ok\":true}", { status: 200 });
+      }
+      throw new Error(`Unexpected fetch: ${url}`);
+    }) as typeof fetch;
+
+    const gh = new GitHubSource();
+    const bundle = await gh.fetch("NousResearch/hermes-agent/skills/red-teaming/godmode/SKILL.md");
+
+    expect(bundle?.supportFiles).toEqual([
+      { path: "scripts/parseltongue.py", content: "print('parseltongue')" },
+      { path: "templates/prefill.json", content: "{\"ok\":true}" },
+    ]);
   });
 });

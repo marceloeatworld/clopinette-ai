@@ -15,10 +15,16 @@ export interface HubSkillMeta {
   collectionLabel?: string;
 }
 
+export interface HubSupportFile {
+  path: string;
+  content: string;
+}
+
 export interface HubSkillBundle {
   meta: HubSkillMeta;
   content: string;         // full SKILL.md content
   frontmatter: Record<string, unknown>;
+  supportFiles?: HubSupportFile[];
 }
 
 export interface HubInstallResult {

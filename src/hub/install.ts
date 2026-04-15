@@ -1,7 +1,7 @@
 import type { SqlFn } from "../config/sql.js";
 import type { HubSkillBundle, HubInstallResult } from "./types.js";
 import type { HubInstalledEntry } from "../config/types.js";
-import { createSkill, editSkill } from "../memory/skills.js";
+import { createSkill, editSkill, replaceSkillSupportFiles } from "../memory/skills.js";
 import { logAudit } from "../enterprise/audit.js";
 import { scanHubBundle } from "./security.js";
 
@@ -47,6 +47,11 @@ export async function installSkill(
   }
 
   if (!result.ok) return { ok: false, error: result.error };
+
+  await replaceSkillSupportFiles(r2, userId, name, (bundle.supportFiles ?? []).map((file) => ({
+    path: file.path,
+    content: file.content,
+  })));
 
   // Record in hub_installed
   const contentHash = await hashContent(bundle.content);

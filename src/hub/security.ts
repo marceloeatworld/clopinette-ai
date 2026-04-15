@@ -39,6 +39,10 @@ export function scanHubBundle(bundle: HubSkillBundle): string | null {
         ...(bundle.meta.tags ?? []),
       ].filter(Boolean).join("\n"),
     },
+    ...((bundle.supportFiles ?? []).map((file) => ({
+      label: `support file ${file.path}`,
+      text: file.content,
+    }))),
   ];
 
   const relaxSemanticScan = bundle.meta.trustLevel === "trusted" || bundle.meta.trustLevel === "builtin";
