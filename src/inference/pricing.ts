@@ -13,7 +13,7 @@
  *   const usd = estimateCost(row.model, row.inputTokens, row.outputTokens);
  */
 
-export const PRICING_UPDATED_AT = "2026-04-11";
+export const PRICING_UPDATED_AT = "2026-04-20";
 
 export interface ModelPricing {
   inputPer1M: number;
@@ -25,7 +25,8 @@ const DEFAULT_PRICING: ModelPricing = { inputPer1M: 0.5, outputPer1M: 1.5 };
 
 const PRICING: Record<string, ModelPricing> = {
   // ── Cloudflare Workers AI ──────────────────────────────────────────────
-  "@cf/moonshotai/kimi-k2.5":               { inputPer1M: 0.50, outputPer1M: 2.00 },
+  "@cf/moonshotai/kimi-k2.6":               { inputPer1M: 0.50, outputPer1M: 2.00 },
+  "@cf/moonshotai/kimi-k2.5":               { inputPer1M: 0.50, outputPer1M: 2.00 }, // legacy — kept for historical cost lookup on old sessions
   "@cf/google/gemma-4-26b-a4b-it":          { inputPer1M: 0.10, outputPer1M: 0.40 },
   "@cf/meta/llama-3.3-70b-instruct-fp8-fast": { inputPer1M: 0.29, outputPer1M: 2.25 },
   "@cf/qwen/qwen-3-8b":                     { inputPer1M: 0.05, outputPer1M: 0.20 },

@@ -115,7 +115,7 @@ Work on every platform (web, Telegram, WhatsApp, Discord).
 
 | Setting | Value |
 |---|---|
-| Workers AI tier | Kimi K2.5 + Gemma 4 26B (free for trial / pro) |
+| Workers AI tier | Kimi K2.6 + Gemma 4 26B (free for trial / pro) |
 | Internal / auxiliary | Gemma 4 26B — compression, self-learning, web summarization, browser snapshots |
 | BYOK | 12 providers via AI Gateway, per-provider config, cross-provider auxiliary |
 | BYOK enforcement | BYOK plan never touches Workers AI for inference — all chat, compression, self-learning, delegates run on the user's own provider |

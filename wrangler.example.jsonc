@@ -6,7 +6,7 @@
   "compatibility_flags": ["nodejs_compat"],
 
   // ─── Workers AI ───
-  // Enables @cf/ model access (Kimi K2.5, Granite, etc.)
+  // Enables @cf/ model access (Kimi K2.6, Granite, etc.)
   "ai": { "binding": "AI" },
 
   // ─── Browser Rendering ───

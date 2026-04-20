@@ -1,6 +1,6 @@
 import type { Platform } from "./types.js";
 
-export const KIMI_MODEL = "@cf/moonshotai/kimi-k2.5";
+export const KIMI_MODEL = "@cf/moonshotai/kimi-k2.6";
 export const GEMMA_MODEL = "@cf/google/gemma-4-26b-a4b-it";
 
 /**

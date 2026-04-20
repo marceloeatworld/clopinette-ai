@@ -321,7 +321,7 @@ export async function handleCommand(
 
     case "/model": {
       // Plan matrix (mirrors the gateway's validateConfigField):
-      //   trial → Workers AI only (Kimi K2.5, Gemma 4)
+      //   trial → Workers AI only (Kimi K2.6, Gemma 4)
       //   pro   → Workers AI + any BYOK provider the user has a key for
       //   byok  → BYOK only (no Workers AI)
       const plan = (await ctx.env.LINKS.get(`plan:${ctx.userId}`)) ?? "trial";

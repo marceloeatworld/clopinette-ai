@@ -2,7 +2,7 @@ import { describe, it, expect } from "vitest";
 import { routeModel } from "../src/inference/router.js";
 
 describe("smart model routing", () => {
-  const PRIMARY = "@cf/moonshotai/kimi-k2.5";
+  const PRIMARY = "@cf/moonshotai/kimi-k2.6";
   const AUXILIARY = "@cf/google/gemma-4-26b-a4b-it";
 
   it("routes simple greetings to auxiliary", () => {

@@ -17,7 +17,7 @@ function createMockSql(rows: MockRow[]) {
 describe("loadInferenceConfig", () => {
   it("returns defaults when no config exists", async () => {
     const config = await loadInferenceConfig(createMockSql([]), TEST_KEY_B64);
-    expect(config.model).toBe("@cf/moonshotai/kimi-k2.5");
+    expect(config.model).toBe("@cf/moonshotai/kimi-k2.6");
     expect(config.apiKey).toBeUndefined();
     expect(config.provider).toBeUndefined();
   });
@@ -39,7 +39,7 @@ describe("loadInferenceConfig", () => {
     const encryptedKey = await encrypt("sk-secret-key", masterKey);
 
     const sql = createMockSql([
-      { key: "model", value: "@cf/moonshotai/kimi-k2.5", encrypted: 0 },
+      { key: "model", value: "@cf/moonshotai/kimi-k2.6", encrypted: 0 },
       { key: "api_key", value: encryptedKey, encrypted: 1 },
     ]);
     const config = await loadInferenceConfig(sql, TEST_KEY_B64);
@@ -51,7 +51,7 @@ describe("loadInferenceConfig", () => {
       { key: "provider", value: "anthropic", encrypted: 0 },
     ]);
     const config = await loadInferenceConfig(sql, TEST_KEY_B64);
-    expect(config.model).toBe("@cf/moonshotai/kimi-k2.5");
+    expect(config.model).toBe("@cf/moonshotai/kimi-k2.6");
     expect(config.provider).toBe("anthropic");
   });
 
@@ -130,13 +130,13 @@ describe("loadInferenceConfig", () => {
       { key: "provider", value: "openai", encrypted: 0 },
     ]);
     const config = await loadInferenceConfig(sql, TEST_KEY_B64);
-    expect(config.model).toBe("@cf/moonshotai/kimi-k2.5");
+    expect(config.model).toBe("@cf/moonshotai/kimi-k2.6");
   });
 
   it("auxiliary defaults to platform AUXILIARY_MODEL (Gemma) for Workers AI users", async () => {
     const sql = createMockSql([
       { key: "provider", value: "workers-ai", encrypted: 0 },
-      { key: "model:workers-ai", value: "@cf/moonshotai/kimi-k2.5", encrypted: 0 },
+      { key: "model:workers-ai", value: "@cf/moonshotai/kimi-k2.6", encrypted: 0 },
     ]);
     const config = await loadInferenceConfig(sql, TEST_KEY_B64);
     expect(config.auxiliaryModel).toBe("@cf/google/gemma-4-26b-a4b-it");
