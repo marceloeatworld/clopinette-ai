@@ -715,13 +715,15 @@ export class ClopinetteAgent extends AIChatAgent<Env, AgentState> {
     "honcho_base_url", "honcho_api_key", "honcho_app_id", "token_budget", "personality",
   ]);
 
-  /** Accepts whitelisted keys plus per-provider keys (api_key:{p}, model:{p}, auxiliary_model:{p}). */
+  /** Accepts whitelisted keys plus per-provider keys (api_key:{p}, model:{p},
+   *  auxiliary_model:{p}) and per-service tokens (service_token:{s}) used by
+   *  codemode's credential-injecting outbound proxy. */
   static isAllowedConfigKey(key: string): boolean {
     if (ClopinetteAgent.ALLOWED_CONFIG_KEYS.has(key)) return true;
-    for (const prefix of ["api_key:", "model:", "auxiliary_model:"]) {
+    for (const prefix of ["api_key:", "model:", "auxiliary_model:", "service_token:"]) {
       if (key.startsWith(prefix)) {
-        const provider = key.slice(prefix.length);
-        return provider.length > 0 && /^[a-z0-9_-]+$/.test(provider);
+        const slug = key.slice(prefix.length);
+        return slug.length > 0 && /^[a-z0-9_-]+$/.test(slug);
       }
     }
     return false;
@@ -1763,7 +1765,11 @@ export class ClopinetteAgent extends AIChatAgent<Env, AgentState> {
           try {
             const plan = coercePlan(this.state.plan);
             const config = await loadInferenceConfig(sqlBound, this.env.MASTER_KEY, plan);
-            auxiliary = createAuxiliaryModel(config, this.env, plan);
+            auxiliary = createAuxiliaryModel(config, this.env, plan, {
+              userId: task.userId,
+              sessionId: task.sessionId,
+              purpose: "selfLearning",
+            });
           } catch (err) {
             if (err instanceof PlanViolationError) {
               console.warn(`[selfLearning] skipped — ${err.message}`);

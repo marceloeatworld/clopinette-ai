@@ -73,7 +73,7 @@ export class DelegateWorkflow extends WorkflowEntrypoint<Env, DelegateWorkflowPa
         retries: { limit: 3, delay: "5 seconds", backoff: "exponential" },
         timeout: "5 minutes",
       },
-      async () => this.#runInference(goal, context, userId),
+      async () => this.#runInference(goal, context, userId, sessionId),
     );
 
     // Step 2: notify the parent DO via RPC — separate step so a failed notify retries
@@ -87,6 +87,7 @@ export class DelegateWorkflow extends WorkflowEntrypoint<Env, DelegateWorkflowPa
     goal: string,
     context: string | undefined,
     userId: string,
+    sessionId: string,
   ): Promise<InferenceOutcome> {
     const start = Date.now();
     const toolTrace: string[] = [];
@@ -105,8 +106,15 @@ export class DelegateWorkflow extends WorkflowEntrypoint<Env, DelegateWorkflowPa
       try {
         const { config, plan } = await stub.getInferenceConfigForDelegation();
         modelId = config.model;
-        model = createModel(config, this.env, undefined, { plan });
-        auxiliary = createAuxiliaryModel(config, this.env, plan);
+        model = createModel(config, this.env, undefined, {
+          plan,
+          telemetry: { userId, sessionId, purpose: "delegate" },
+        });
+        auxiliary = createAuxiliaryModel(config, this.env, plan, {
+          userId,
+          sessionId,
+          purpose: "delegateAux",
+        });
       } catch (err) {
         if (err instanceof PlanViolationError) {
           return {

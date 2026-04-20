@@ -21,6 +21,7 @@ import { mirrorMessage, type MirrorVectorCtx } from "./memory/session-search.js"
 import type { LanguageModel } from "ai";
 import { compressContext } from "./compression.js";
 import { resolveTools, buildTools } from "./tools/registry.js";
+import { loadServiceTokens } from "./tools/credential-fetcher.js";
 import {
   createModel,
   createAuxiliaryModel,
@@ -533,7 +534,12 @@ export async function runPipeline(
     // Step 3: Build the auxiliary model ONCE — used by compression, self-learning,
     // web summarization, browser snapshots, and the simple-routing fast path.
     // For BYOK this routes to the user's BYOK provider; for trial/pro it lands on Gemma.
-    auxiliary = createAuxiliaryModel(config, ctx.env, ctx.plan);
+    auxiliary = createAuxiliaryModel(config, ctx.env, ctx.plan, {
+      userId: ctx.userId,
+      sessionId: ctx.sessionId,
+      platform: ctx.platform,
+      purpose: "auxiliary",
+    });
 
     // Step 4: Create the primary model with session affinity.
     // For the simple/auxiliary branch we reuse the pre-built auxiliary model
@@ -544,6 +550,12 @@ export async function runPipeline(
       model = createModel(config, ctx.env, routing.model, {
         sessionAffinity: ctx.userId,
         plan: ctx.plan,
+        telemetry: {
+          userId: ctx.userId,
+          sessionId: ctx.sessionId,
+          platform: ctx.platform,
+          purpose: "primary",
+        },
       });
     }
 
@@ -710,6 +722,13 @@ async function runPipelineInner(
   }
 
   // Step 8: Build tools
+  // Load + decrypt the user's service tokens once per turn so codemode's
+  // outbound proxy can inject Authorization headers for services like GitHub.
+  // Loaded only when codemode is enabled — classic-mode tools don't use them.
+  const serviceTokens = codemodeEnabled
+    ? await loadServiceTokens(ctx.sql, ctx.env.MASTER_KEY)
+    : undefined;
+
   const toolCtx = {
     sql: ctx.sql,
     r2Memories: ctx.env.MEMORIES,
@@ -728,6 +747,7 @@ async function runPipelineInner(
     braveApiKey: ctx.env.BRAVE_API_KEY,
     loader: codemodeEnabled ? ctx.env.LOADER : undefined,
     globalOutbound: codemodeEnabled ? ctx.env.CODEMODE_OUTBOUND : undefined,
+    serviceTokens,
     playwrightMcp: ctx.env.PlaywrightMCP,
     platform: ctx.platform,
     chatId: ctx.chatId,
@@ -1085,7 +1105,15 @@ async function runPipelineInner(
     if (fallback) {
       console.log(`[pipeline] Falling back to ${fallback.model}`);
       try {
-        const fbModel = createModel(fallback, ctx.env, fallback.model, { plan: ctx.plan });
+        const fbModel = createModel(fallback, ctx.env, fallback.model, {
+          plan: ctx.plan,
+          telemetry: {
+            userId: ctx.userId,
+            sessionId: ctx.sessionId,
+            platform: ctx.platform,
+            purpose: "fallback",
+          },
+        });
         const fbResult = await generateText({
           model: fbModel,
           system: systemPrompt,

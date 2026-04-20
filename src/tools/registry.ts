@@ -3,6 +3,7 @@ import { createCodeTool } from "@cloudflare/codemode/ai";
 import { DynamicWorkerExecutor } from "@cloudflare/codemode";
 import type { LanguageModel } from "ai";
 import type { SqlFn } from "../config/sql.js";
+import { buildCredentialFetcher } from "./credential-fetcher.js";
 import { createMemoryTool } from "./memory-tool.js";
 import { createSessionSearchTool } from "./session-search-tool.js";
 import { createSkillsTool } from "./skills-tool.js";
@@ -46,6 +47,10 @@ export interface ToolContext {
   braveApiKey?: string;
   loader?: WorkerLoader;
   globalOutbound?: Fetcher;
+  /** Per-service bearer tokens keyed by service slug (e.g. `github`). Captured
+   *  here so codemode's outbound proxy can inject `Authorization` without the
+   *  LLM-written sandbox code ever seeing the credential. */
+  serviceTokens?: Record<string, string>;
   playwrightMcp?: DurableObjectNamespace;
   platform?: import("../config/types.js").Platform;
   /** Chat id for non-WS platforms (Telegram chatId, WhatsApp phone, Discord channelId).
@@ -143,9 +148,13 @@ export function resolveTools(ctx: ToolContext) {
     ...orchestrationTools
   } = allTools;
 
+  const outbound = ctx.globalOutbound && ctx.serviceTokens
+    ? buildCredentialFetcher(ctx.globalOutbound, ctx.serviceTokens)
+    : (ctx.globalOutbound ?? null);
+
   const executor = new DynamicWorkerExecutor({
     loader: ctx.loader,
-    globalOutbound: ctx.globalOutbound ?? null,
+    globalOutbound: outbound,
   });
   const codemode = createCodeTool({ tools: orchestrationTools, executor });
 

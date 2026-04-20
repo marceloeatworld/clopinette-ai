@@ -1,13 +1,42 @@
 import { createWorkersAI } from "workers-ai-provider";
 import { createOpenAI } from "@ai-sdk/openai";
 import type { LanguageModel } from "ai";
-import type { AgentConfigRow, InferenceConfig } from "../config/types.js";
+import type { AgentConfigRow, InferenceConfig, Platform } from "../config/types.js";
 import { DEFAULT_MODEL, AUXILIARY_MODEL, isWorkersAiModel } from "../config/constants.js";
 import { deriveMasterKey, decrypt } from "../crypto.js";
 
 import type { SqlFn } from "../config/sql.js";
 
 export type Plan = "trial" | "pro" | "byok" | undefined;
+
+/**
+ * Telemetry tagged onto every AI Gateway call via the `cf-aig-metadata` header.
+ * Surfaces in the AI Gateway dashboard as per-user / per-session / per-purpose
+ * cost and latency breakdowns without extra logging infrastructure.
+ */
+export type TelemetryContext = {
+  userId?: string;
+  sessionId?: string;
+  platform?: Platform;
+  purpose?: "primary" | "auxiliary" | "fallback" | "delegate" | "delegateAux" | "selfLearning";
+};
+
+function buildMetadataFetch(telemetry?: TelemetryContext): typeof fetch | undefined {
+  if (!telemetry) return undefined;
+  const metadata: Record<string, string> = {};
+  if (telemetry.userId) metadata.userId = telemetry.userId;
+  if (telemetry.sessionId) metadata.sessionId = telemetry.sessionId;
+  if (telemetry.platform) metadata.platform = telemetry.platform;
+  if (telemetry.purpose) metadata.purpose = telemetry.purpose;
+  if (Object.keys(metadata).length === 0) return undefined;
+  const header = JSON.stringify(metadata);
+  const globalFetch = fetch;
+  return async (input, init) => {
+    const headers = new Headers(init?.headers);
+    headers.set("cf-aig-metadata", header);
+    return globalFetch(input as RequestInfo, { ...init, headers });
+  };
+}
 
 /**
  * Thrown when a BYOK user would otherwise consume Workers AI.
@@ -42,15 +71,17 @@ export function createModel(
   config: InferenceConfig,
   env: { AI: Ai; CF_ACCOUNT_ID: string; CF_GATEWAY_ID: string },
   modelOverride?: string,
-  options?: { sessionAffinity?: string; plan?: Plan }
+  options?: { sessionAffinity?: string; plan?: Plan; telemetry?: TelemetryContext }
 ): LanguageModel {
   const configuredModel = modelOverride ?? config.model ?? DEFAULT_MODEL;
   const plan = options?.plan;
 
   if (config.apiKey && config.provider && config.provider !== "workers-ai") {
+    const customFetch = buildMetadataFetch(options?.telemetry);
     const provider = createOpenAI({
       apiKey: config.apiKey,
       baseURL: `https://gateway.ai.cloudflare.com/v1/${env.CF_ACCOUNT_ID}/${env.CF_GATEWAY_ID}/${config.provider}`,
+      ...(customFetch ? { fetch: customFetch } : {}),
     });
     return provider(configuredModel);
   }
@@ -86,6 +117,7 @@ export function createAuxiliaryModel(
   config: InferenceConfig,
   env: { AI: Ai; CF_ACCOUNT_ID: string; CF_GATEWAY_ID: string },
   plan: Plan,
+  telemetry?: TelemetryContext,
 ): { model: LanguageModel; modelId: string } {
   const auxProvider = config.auxiliaryProvider ?? config.provider;
   const auxApiKey = config.auxiliaryApiKey ?? config.apiKey;
@@ -93,9 +125,11 @@ export function createAuxiliaryModel(
 
   // BYOK auxiliary route — requires a real BYOK provider + key.
   if (auxApiKey && auxProvider && auxProvider !== "workers-ai") {
+    const customFetch = buildMetadataFetch(telemetry);
     const provider = createOpenAI({
       apiKey: auxApiKey,
       baseURL: `https://gateway.ai.cloudflare.com/v1/${env.CF_ACCOUNT_ID}/${env.CF_GATEWAY_ID}/${auxProvider}`,
+      ...(customFetch ? { fetch: customFetch } : {}),
     });
     return { model: provider(auxModelId), modelId: auxModelId };
   }
