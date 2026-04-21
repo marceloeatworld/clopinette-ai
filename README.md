@@ -39,7 +39,7 @@ Supporting Cloudflare services (used transparently):
 - **14 personality presets** — helpful, concise, technical, kawaii, pirate, shakespeare, noir, uwu, etc. (`/personality`)
 - **Skills Hub** — install skills from the built-in catalog or trusted GitHub repos like Hermes, Cloudflare, MiniMax, and gstack
 - **Hub hardening** — scans imported skills for prompt-injection / exfiltration structure before install, while preserving trusted security and red-team bundles
-- **BYOK** — bring your own key across 12 providers (OpenAI, Anthropic, Groq, xAI, Mistral, DeepSeek, …) via the Cloudflare AI Gateway
+- **BYOK** — bring your own key across 13 providers (OpenAI, Anthropic, Google AI Studio, Groq, xAI/Grok, Mistral, DeepSeek, Cohere, Perplexity, OpenRouter, Cerebras, HuggingFace, Replicate) via the Cloudflare AI Gateway
 - **Cross-provider auxiliary** — e.g. primary OpenAI + auxiliary Anthropic for the fast-path / compression
 - **Self-learning** — the agent updates its own memory after N turns
 - **Async delegation with auto-resume** — web-only research sub-agents run in parallel via Cloudflare Workflows. When the last delegate finishes, the agent automatically synthesizes their results and pushes the final reply via the originating gateway (web / Telegram / WhatsApp / Discord). No need to send a follow-up message.
@@ -60,7 +60,7 @@ Primary tools available to the agent:
 | `calendar` | Events + one-shot reminders delivered on all platforms |
 | `todo` | Task list |
 | `image` | Image generation (FLUX Schnell) |
-| `tts` | Text-to-speech (12 voices, Deepgram Aura) |
+| `tts` | Text-to-speech (9 voices, Deepgram Aura: luna, asteria, athena, zeus, orpheus, orion, helios, hera, stella) |
 | `clarify` | Ask the user a structured question mid-execution |
 | `browser` | Playwright MCP (navigate, click, type, snapshot, diagnostics, human handoff) — conditional |
 | `delegate` | Run parallel web-only research sub-agents in the background — conditional |
@@ -94,7 +94,7 @@ Work on every platform (web, Telegram, WhatsApp, Discord).
 | Command | Description |
 |---|---|
 | `/status` | Model, tokens, session info |
-| `/research <topic>` | Deep research with parallel sub-agents (auto-synthesized reply) |
+| `/research <topic>` (alias `/deepsearch`) | Deep research with parallel sub-agents (auto-synthesized reply) |
 | `/model [provider id]` | Show or switch the active LLM (plan-aware) |
 | `/insights` | Cost breakdown by model this month (USD estimate) |
 | `/memory` | Show MEMORY.md and USER.md |
@@ -108,7 +108,7 @@ Work on every platform (web, Telegram, WhatsApp, Discord).
 | `/forget` | Clear memory |
 | `/reset` or `/clear` | Reset current session |
 | `/wipe CONFIRM` | Delete everything except your BYOK provider config |
-| `/link` | Generate identity linking code (Telegram / WhatsApp / Discord) |
+| `/link` | Identity linking (handled per platform: Telegram prompts, WhatsApp + Discord have `/link trusted` / `/link shared` for group modes) |
 | `/help` | List all commands |
 
 ## Inference
@@ -117,7 +117,7 @@ Work on every platform (web, Telegram, WhatsApp, Discord).
 |---|---|
 | Workers AI tier | Kimi K2.6 + Gemma 4 26B (free for trial / pro) |
 | Internal / auxiliary | Gemma 4 26B — compression, self-learning, web summarization, browser snapshots |
-| BYOK | 12 providers via AI Gateway, per-provider config, cross-provider auxiliary |
+| BYOK | 13 providers via AI Gateway, per-provider config, cross-provider auxiliary |
 | BYOK enforcement | BYOK plan never touches Workers AI for inference — all chat, compression, self-learning, delegates run on the user's own provider |
 | Max steps | 6 parent, 2 delegate |
 | Context compression | Structured summary at 40+ messages |
