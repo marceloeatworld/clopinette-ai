@@ -105,7 +105,7 @@ export async function registerTelegramWebhook(
           { command: "status", description: "Model, tokens, agent info" },
           { command: "research", description: "Deep research with parallel sub-agents" },
           { command: "model", description: "Show or switch the active LLM" },
-          { command: "insights", description: "Cost breakdown by model this month" },
+          { command: "insights", description: "Usage breakdown by model this month" },
           { command: "memory", description: "Show persistent memory" },
           { command: "forget", description: "Clear MEMORY.md and USER.md" },
           { command: "skills", description: "List installed skills" },

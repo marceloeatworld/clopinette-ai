@@ -119,11 +119,7 @@ export async function handleCommand(
     }
 
     case "/insights": {
-      // Per-model cost breakdown for the current calendar month.
-      // Assumes a 30/70 input/output split — a typical long-reply chat pattern.
-      // Users get a `Prices updated: ...` footer so stale estimates are obvious.
-      const { estimateCost, isKnownModel, PRICING_UPDATED_AT } = await import("./inference/pricing.js");
-
+      // Per-model usage breakdown for the current calendar month.
       const now = new Date();
       const monthStart = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-01`;
 
@@ -140,39 +136,24 @@ export async function handleCommand(
         return { text: "No recorded usage this month yet. Have a chat first.", handled: true };
       }
 
-      const INPUT_RATIO = 0.3;
-      const OUTPUT_RATIO = 0.7;
-      let totalCost = 0;
       let totalTokens = 0;
-      let hasUnknown = false;
 
       const lines: string[] = [
         "**Month usage by model**",
         "",
-        "| Model | Sessions | Tokens | Est. cost |",
-        "| --- | ---:| ---:| ---:|",
+        "| Model | Sessions | Tokens |",
+        "| --- | ---:| ---:|",
       ];
 
       for (const row of perModel) {
         const model = row.model ?? "(unknown)";
-        const inputTokens = Math.round(row.tokens * INPUT_RATIO);
-        const outputTokens = Math.round(row.tokens * OUTPUT_RATIO);
-        const cost = estimateCost(model, inputTokens, outputTokens);
-        totalCost += cost;
         totalTokens += row.tokens;
-        const flag = isKnownModel(model) ? "" : " ⚠︎";
         const label = model.length > 42 ? model.slice(0, 39) + "..." : model;
-        if (!isKnownModel(model)) hasUnknown = true;
-        lines.push(`| \`${label}\`${flag} | ${row.sessions} | ${(row.tokens / 1000).toFixed(1)}k | $${cost.toFixed(3)} |`);
+        lines.push(`| \`${label}\` | ${row.sessions} | ${(row.tokens / 1000).toFixed(1)}k |`);
       }
 
       lines.push("");
-      lines.push(`**Total:** ${(totalTokens / 1000).toFixed(1)}k tokens — **$${totalCost.toFixed(2)}** (estimated)`);
-      lines.push("");
-      lines.push(`_Assumes 30/70 input/output split. Prices updated: ${PRICING_UPDATED_AT}._`);
-      if (hasUnknown) {
-        lines.push(`_⚠︎ = model not in pricing table, default rate applied._`);
-      }
+      lines.push(`**Total:** ${(totalTokens / 1000).toFixed(1)}k tokens`);
 
       return { text: lines.join("\n"), handled: true };
     }
@@ -528,7 +509,7 @@ export async function handleCommand(
           "**Available commands:**",
           "/status — Model, tokens, agent info",
           "/model — Show or switch the active model (`/model <provider> <id>`)",
-          "/insights — Cost breakdown by model this month",
+          "/insights — Usage breakdown by model this month",
           "/research <topic> — Deep research with parallel sub-agents",
           "/memory — Show persistent memory",
           "/soul — Show personality file",

@@ -2,6 +2,7 @@ import type { Platform } from "./types.js";
 
 export const KIMI_MODEL = "@cf/moonshotai/kimi-k2.6";
 export const GEMMA_MODEL = "@cf/google/gemma-4-26b-a4b-it";
+export const GLM_MODEL = "@cf/zai-org/glm-4.7-flash";
 
 /**
  * DEFAULT_MODEL is the user-facing Workers AI fallback when no explicit model is
@@ -17,7 +18,7 @@ export const DEFAULT_MODEL = KIMI_MODEL;
 export const AUXILIARY_MODEL = GEMMA_MODEL;
 
 /** Workers AI models available to trial + pro plans as user-facing chat models. */
-export const WORKERS_AI_MODELS = [KIMI_MODEL, GEMMA_MODEL] as const;
+export const WORKERS_AI_MODELS = [KIMI_MODEL, GEMMA_MODEL, GLM_MODEL] as const;
 export type WorkersAiModel = typeof WORKERS_AI_MODELS[number];
 export function isWorkersAiModel(model: string): model is WorkersAiModel {
   return (WORKERS_AI_MODELS as readonly string[]).includes(model);

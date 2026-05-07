@@ -122,7 +122,7 @@ export async function registerDiscordCommands(
         { name: "id", description: "Model id (e.g. claude-sonnet-4-5)", type: 3, required: false },
       ],
     },
-    { name: "insights", description: "Cost breakdown by model this month" },
+    { name: "insights", description: "Usage breakdown by model this month" },
     { name: "status", description: "Model, tokens, agent info" },
     { name: "memory", description: "Show persistent memory" },
     { name: "forget", description: "Clear MEMORY.md and USER.md" },
