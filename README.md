@@ -96,7 +96,7 @@ Work on every platform (web, Telegram, WhatsApp, Discord).
 | `/status` | Model, tokens, session info |
 | `/research <topic>` (alias `/deepsearch`) | Deep research with parallel sub-agents (auto-synthesized reply) |
 | `/model [provider id]` | Show or switch the active LLM (plan-aware) |
-| `/insights` | Cost breakdown by model this month (USD estimate) |
+| `/insights` | Usage breakdown by model this month |
 | `/memory` | Show MEMORY.md and USER.md |
 | `/soul` | Show SOUL.md personality (`/soul reset` to restore default) |
 | `/personality [name]` | Switch personality or list the 14 presets |
@@ -115,7 +115,7 @@ Work on every platform (web, Telegram, WhatsApp, Discord).
 
 | Setting | Value |
 |---|---|
-| Workers AI tier | Kimi K2.6 + Gemma 4 26B (free for trial / pro) |
+| Workers AI tier | Kimi K2.6 + Gemma 4 26B + GLM 4.7 Flash (free for trial / pro) |
 | Internal / auxiliary | Gemma 4 26B — compression, self-learning, web summarization, browser snapshots |
 | BYOK | 13 providers via AI Gateway, per-provider config, cross-provider auxiliary |
 | BYOK enforcement | BYOK plan never touches Workers AI for inference — all chat, compression, self-learning, delegates run on the user's own provider |
