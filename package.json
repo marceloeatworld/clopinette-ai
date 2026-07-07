@@ -1,0 +1,34 @@
+{
+  "name": "clopinette-ai",
+  "version": "0.1.0",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "dev": "wrangler dev --remote",
+    "deploy": "wrangler deploy",
+    "types": "wrangler types src/env.d.ts",
+    "check": "tsc --noEmit",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@ai-sdk/openai": "^3.0.81",
+    "@cloudflare/ai-chat": "^0.2.6",
+    "@cloudflare/codemode": "^0.3.8",
+    "@cloudflare/playwright-mcp": "^0.0.5",
+    "agents": "^0.8.7",
+    "ai": "^6.0.220",
+    "fflate": "^0.8.3",
+    "hono": "^4.12.28",
+    "hono-agents": "^3.0.11",
+    "mammoth": "^1.12.0",
+    "unpdf": "^1.6.2",
+    "workers-ai-provider": "^3.3.1",
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20260702.1",
+    "typescript": "^5.9.3",
+    "vitest": "^4.1.10",
+    "wrangler": "^4.107.0"
+  }
+}
