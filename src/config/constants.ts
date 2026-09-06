@@ -33,6 +33,10 @@ export const IMAGE_GEN_TOKEN_EQUIVALENT = 250;
 export const TTS_TOKENS_PER_CHAR = 8;
 export const WHISPER_TOKENS_PER_KB = 1;
 export const MAX_STEPS = 6; // Force fast conclusions. Budget pressure (enhanceTools): CAUTION at step 4, CRITICAL from step 5.
+
+// Per-user prompt rate limit (all platforms). Token quotas bound cost; this bounds bursts.
+export const RATE_LIMIT_PER_MINUTE = 20;
+export const RATE_LIMIT_PER_HOUR = 300;
 export const MEMORY_CHAR_LIMIT = 2200;
 export const USER_CHAR_LIMIT = 1375;
 export const SQL_MAX_CONTENT_LENGTH = 90_000;

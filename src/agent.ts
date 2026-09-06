@@ -33,6 +33,8 @@ import {
   DEFAULT_MODEL,
   KIMI_MODEL,
   MAX_PERSISTED_MESSAGES,
+  RATE_LIMIT_PER_MINUTE,
+  RATE_LIMIT_PER_HOUR,
   MEMORY_CHAR_LIMIT,
   USER_CHAR_LIMIT,
 } from "./config/constants.js";
@@ -89,6 +91,26 @@ export class ClopinetteAgent extends AIChatAgent<Env, AgentState> {
     resolve: (result: import("./pipeline.js").ElicitResult) => void;
     timer: ReturnType<typeof setTimeout>;
   }>();
+
+  /** Timestamps (ms) of user prompts in the last hour — sliding-window rate limit.
+   *  In-memory: the DO is single-threaded per user, and a reset on eviction only
+   *  ever lets a burst through, never blocks a legitimate user. */
+  #promptTimestamps: number[] = [];
+
+  /** Returns a user-facing message when the per-user prompt rate limit is hit, else records the prompt. */
+  #checkRateLimit(): string | null {
+    const now = Date.now();
+    this.#promptTimestamps = this.#promptTimestamps.filter((t) => now - t < 3_600_000);
+    const lastMinute = this.#promptTimestamps.filter((t) => now - t < 60_000).length;
+    if (lastMinute >= RATE_LIMIT_PER_MINUTE) {
+      return `Too many messages: limit is ${RATE_LIMIT_PER_MINUTE} per minute. Please wait a moment.`;
+    }
+    if (this.#promptTimestamps.length >= RATE_LIMIT_PER_HOUR) {
+      return `Too many messages: limit is ${RATE_LIMIT_PER_HOUR} per hour. Please try again later.`;
+    }
+    this.#promptTimestamps.push(now);
+    return null;
+  }
 
   #getCachedSystemPrompt(platform: string): string | null {
     const entry = this.#cachedSystemPrompts.get(platform);
@@ -539,6 +561,15 @@ export class ClopinetteAgent extends AIChatAgent<Env, AgentState> {
       cleanUserText = cmdResult.rewriteAs;
     }
 
+    // Per-user burst protection (slash commands above are free)
+    const rateLimited = this.#checkRateLimit();
+    if (rateLimited) {
+      for (const ws of this.ctx.getWebSockets()) {
+        try { ws.send(JSON.stringify({ type: "error", message: rateLimited })); } catch { /* closed */ }
+      }
+      return new Response(JSON.stringify({ error: rateLimited }), { status: 429, headers: { "Content-Type": "application/json" } });
+    }
+
     // AI SDK v6 tool parts are `tool-${name}` / `dynamic-tool` (v4's "tool-invocation" is gone)
     const recentToolUse = this.messages.slice(-5).some(m =>
       (m.parts ?? []).some(p => p.type.startsWith("tool-") || p.type === "dynamic-tool")
@@ -715,6 +746,13 @@ export class ClopinetteAgent extends AIChatAgent<Env, AgentState> {
     if (cmdResult?.handled === false) {
       // Rewrite mode (e.g. /research) — replace user text and run the pipeline.
       effectiveUserText = cmdResult.rewriteAs;
+    }
+
+    // Per-user burst protection for messaging platforms. Internal turns (cron,
+    // digests, delegate resume run as "api" / ephemeral) are not user bursts.
+    if (platform !== "api" && !ephemeral) {
+      const rateLimited = this.#checkRateLimit();
+      if (rateLimited) return { error: rateLimited };
     }
 
     // Always load conversation history — even for simple messages, the fast path
