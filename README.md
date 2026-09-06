@@ -78,17 +78,18 @@ With codemode active (when the `LOADER` binding is set), the LLM writes JavaScri
 
 ### Browser Run observability
 
-- `browser({ action: "diagnostics" })` returns operator guidance for Browser Run Live View and Human in the Loop.
-- `browser({ action: "request_human", reason: "..." })` produces a structured handoff when login, MFA, CAPTCHA, or sensitive data entry blocks automation.
-- `web` responses backed by Browser Run quick actions now include `browserRun.sessionId`, `browserRun.browserMsUsed`, and `browserRun.cfRay` when Cloudflare returns them.
-- Browser Run Live View / HITL are available for active browser sessions. In this codebase, the current `@cloudflare/playwright-mcp` wrapper does not expose the Browser Run session ID or direct Live View URL in tool results, so the operator flow is:
+- Every successful `browser` action returns `browserRun.sessionId` (the Browser Run session behind this user's browser, one per user DO).
+- `navigate`, `live_view`, `diagnostics` and `request_human` also return `browserRun.liveViewUrl` (CDP `Cloudflare.getLiveView`, tab mode, 15 min validity) so a human can watch or take over for login, MFA, CAPTCHA, or sensitive data entry, then tell the agent to continue.
+- `browser({ action: "diagnostics" })` returns operator guidance; `browser({ action: "request_human", reason: "..." })` produces a structured handoff with the Live View link. Fallback without a link:
 
 ```bash
 wrangler browser list
 wrangler browser view <SESSION_ID>
 ```
 
-- Browser Run Session Recordings require launching a browser session with `recording: true`. The current Playwright MCP wrapper used by Clopinette does not expose a recording toggle yet.
+- `web` responses backed by Browser Run quick actions include `browserRun.sessionId`, `browserRun.browserMsUsed`, and `browserRun.cfRay` when Cloudflare returns them.
+- The core worker talks to the `PlaywrightMCP` Durable Object over DO RPC (`callTool`, `getBrowserRunInfo`); external MCP clients use `/mcp` (streamable HTTP, `API_AUTH_KEY` bearer) served through the Agents SDK handler.
+- Browser Run Session Recordings require launching a browser session with `recording: true`. The Playwright MCP context factory does not expose a recording toggle yet.
 
 ## Slash commands
 

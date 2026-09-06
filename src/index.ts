@@ -11,8 +11,9 @@ import { timingSafeEqual } from "./enterprise/safe-compare.js";
 let cachedBotSecret: string | null = null;
 
 // Re-export DO and Workflow classes for wrangler discovery
+import { PlaywrightMCP } from "./playwright-mcp.js";
 export { ClopinetteAgent } from "./agent.js";
-export { PlaywrightMCP } from "./playwright-mcp.js";
+export { PlaywrightMCP };
 export { DelegateWorkflow } from "./delegate-workflow.js";
 export { BackfillVectorsWorkflow } from "./backfill-workflow.js";
 
@@ -641,16 +642,20 @@ app.post("/webhook/evolution", async (c) => {
 
 // ───────────────────────── Playwright MCP ─────────────────────────
 
-app.get("/mcp", async (c) => {
+// External MCP clients (streamable HTTP). The DO only speaks the Agents SDK
+// WebSocket transport, so requests must go through McpAgent.serve(), which
+// bridges HTTP <-> DO and names one DO per MCP session. Forwarding the raw
+// request to the DO returned "Expected WebSocket Upgrade request".
+const mcpHandler = PlaywrightMCP.serve("/mcp", { binding: "PlaywrightMCP" });
+app.all("/mcp", async (c) => {
   const authKey = c.env.API_AUTH_KEY;
   if (!authKey) return c.json({ error: "Service not available" }, 503);
   const authHeader = c.req.header("Authorization") ?? "";
   const token = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : "";
   if (!token || !timingSafeEqual(token, authKey)) return c.json({ error: "Unauthorized" }, 401);
 
-  const id = c.env.PlaywrightMCP.idFromName("default");
-  const stub = c.env.PlaywrightMCP.get(id);
-  return stub.fetch(c.req.raw);
+  // The handler is typed against the wrapper's older workers-types; the runtime object is the same
+  return mcpHandler.fetch(c.req.raw, c.env, c.executionCtx as unknown as Parameters<typeof mcpHandler.fetch>[2]);
 });
 
 // ───────────────────────── 404 ─────────────────────────
