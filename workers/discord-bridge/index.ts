@@ -5,7 +5,7 @@
  * Env vars:
  *   DISCORD_TOKEN        — Bot token
  *   BRIDGE_SECRET        — Shared secret (from POST /api/admin/setup-discord)
- *   WORKER_URL           — e.g. https://clopinette-ai.aiteklabs.workers.dev
+ *   WORKER_URL           — e.g. https://your-worker.workers.dev
  *   BOT_USER_ID          — (auto-detected from READY event)
  *
  * Discord Gateway protocol (v10):
