@@ -1,0 +1,126 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "clopinette-ai",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-03-24",
+  "compatibility_flags": ["nodejs_compat"],
+
+  // ─── Workers AI ───
+  // Managed models for trial / pro plans (Kimi K3 default, Gemma 4 auxiliary)
+  "ai": { "binding": "AI" },
+
+  // ─── Browser Rendering ───
+  // Required for the web tool's Browser Run quick actions and Playwright MCP
+  // Enable in CF dashboard: Workers & Pages → Browser Rendering
+  "browser": { "binding": "BROWSER" },
+
+  // ─── Durable Objects ───
+  // ClopinetteAgent: the AI agent with SQLite storage (sessions, memory, skills)
+  // PlaywrightMCP: headless browser automation via MCP protocol
+  "durable_objects": {
+    "bindings": [
+      { "name": "CLOPINETTE_AGENT", "class_name": "ClopinetteAgent" },
+      { "name": "PlaywrightMCP", "class_name": "PlaywrightMCP" }
+    ]
+  },
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["ClopinetteAgent"] },
+    { "tag": "v2", "new_sqlite_classes": ["PlaywrightMCP"] }
+  ],
+
+  // ─── R2 Buckets ───
+  // Create before deploying:
+  //   wrangler r2 bucket create clopinette-memories
+  //   wrangler r2 bucket create clopinette-skills
+  "r2_buckets": [
+    { "binding": "MEMORIES", "bucket_name": "clopinette-memories" },
+    { "binding": "SKILLS", "bucket_name": "clopinette-skills" }
+  ],
+
+  // ─── KV ───
+  // Platform identity links (Telegram chatId -> userId), plan/quota cache, bot config.
+  // Create: wrangler kv namespace create LINKS
+  "kv_namespaces": [
+    { "binding": "LINKS", "id": "REPLACE_WITH_KV_ID" }
+  ],
+
+  // ─── Vectorize ───
+  // Hybrid keyword + semantic search over chat history (bge-m3, 1024-d, cosine).
+  // Create:
+  //   wrangler vectorize create clopinette-sessions --dimensions=1024 --metric=cosine
+  //   wrangler vectorize create-metadata-index clopinette-sessions --property-name=userId --type=string
+  //   wrangler vectorize create-metadata-index clopinette-sessions --property-name=sessionId --type=string
+  "vectorize": [
+    { "binding": "VECTORS", "index_name": "clopinette-sessions" }
+  ],
+
+  // ─── Queues ───
+  // Retry-safe usage reports consumed by the gateway worker.
+  // Create: wrangler queues create clopinette-usage && wrangler queues create clopinette-usage-dlq
+  "queues": {
+    "producers": [
+      { "binding": "USAGE_QUEUE", "queue": "clopinette-usage" }
+    ]
+  },
+
+  // ─── Workflows ───
+  // Async delegation (parallel sub-agents) and one-shot Vectorize backfill.
+  // Created automatically on first deploy.
+  "workflows": [
+    { "binding": "DELEGATE_WORKFLOW", "name": "delegate-workflow", "class_name": "DelegateWorkflow" },
+    { "binding": "BACKFILL_VECTORS_WORKFLOW", "name": "backfill-vectors-workflow", "class_name": "BackfillVectorsWorkflow" }
+  ],
+
+  // ─── Dynamic Workers (optional) ───
+  // Enables codemode: the LLM writes JS code instead of individual tool calls.
+  // Requires Workers Paid plan. Remove BOTH sections below to use regular tools.
+  "worker_loaders": [{ "binding": "LOADER" }],
+  // Codemode outbound: SSRF-safe fetch proxy for sandbox code.
+  // Deploy workers/outbound/ first (cd workers/outbound && wrangler deploy).
+  "services": [
+    { "binding": "CODEMODE_OUTBOUND", "service": "clopinette-outbound" }
+  ],
+
+  // ─── Env vars ───
+  "vars": {
+    // Comma-separated list of allowed CORS origins (add http://localhost:5173 for local dev)
+    "CORS_ORIGINS": "https://your-frontend.pages.dev"
+  },
+
+  // ─── Custom domain (optional) ───
+  // "routes": [{ "pattern": "agent.example.com", "custom_domain": true }],
+
+  // ─── Observability ───
+  "observability": { "enabled": true, "head_sampling_rate": 1 }
+
+  // ─── Secrets ───
+  // Set each via: wrangler secret put <NAME>
+  //
+  // Required:
+  //   MASTER_KEY          — AES-256 key for BYOK API key encryption
+  //                         Generate: openssl rand -base64 32
+  //   CF_ACCOUNT_ID       — Your Cloudflare account ID (`wrangler whoami`)
+  //   CF_GATEWAY_ID       — AI Gateway ID for BYOK provider proxying
+  //                         Create: Dashboard → AI → AI Gateway
+  //   WS_SIGNING_SECRET   — HMAC secret shared with the gateway worker for
+  //                         ephemeral WebSocket token verification
+  //                         Generate: openssl rand -base64 32
+  //   API_AUTH_KEY        — Static bearer token for /api/* admin routes and the
+  //                         live smoke test
+  //
+  // Optional:
+  //   GATEWAY_URL            — Gateway worker URL, used to refresh a stale quota cache
+  //   GATEWAY_INTERNAL_KEY   — Secret for /internal/* calls (falls back to WS_SIGNING_SECRET)
+  //   SEARXNG_URL            — Self-hosted SearXNG (first web search backend)
+  //   BRAVE_API_KEY          — Brave Search API (second backend, free tier 2000/month)
+  //   CF_BROWSER_TOKEN       — Browser Rendering API token (last-resort search + read/extract/crawl)
+  //   GITHUB_TOKEN           — Raises GitHub API limits for the Skills Hub
+  //   TELEGRAM_BOT_TOKEN     — Telegram bot (then POST /api/admin/setup-telegram)
+  //   WHATSAPP_ACCESS_TOKEN, WHATSAPP_VERIFY_TOKEN, WHATSAPP_APP_SECRET, WHATSAPP_PHONE_NUMBER_ID
+  //                          — WhatsApp Meta Cloud API
+  //   EVOLUTION_API_URL, EVOLUTION_API_KEY — Self-hosted WhatsApp via Evolution / Baileys
+  //   DISCORD_PUBLIC_KEY, DISCORD_APPLICATION_ID, DISCORD_TOKEN — Discord bot
+  //   DISCORD_REQUIRE_MENTION        — "false" to answer every guild message (default: mention only)
+  //   DISCORD_FREE_RESPONSE_CHANNELS — Comma-separated channel ids that never require a mention
+  //   SLACK_BOT_TOKEN, SLACK_SIGNING_SECRET — Slack (signature verification only, adapter is a stub)
+}

@@ -1,0 +1,24 @@
+services:
+  discord-bridge:
+    build:
+      context: .
+      dockerfile_inline: |
+        FROM oven/bun:1-slim
+        WORKDIR /app
+        COPY index.ts .
+        USER bun
+        CMD ["bun", "run", "index.ts"]
+    restart: unless-stopped
+    environment:
+      - DISCORD_TOKEN=${DISCORD_TOKEN}
+      - BRIDGE_SECRET=${BRIDGE_SECRET}
+      - WORKER_URL=${WORKER_URL}
+      - PORT=3100
+    expose:
+      - "3100"
+    healthcheck:
+      test: ["CMD", "bun", "-e", "fetch('http://localhost:3100/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
