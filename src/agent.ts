@@ -31,6 +31,7 @@ import type {
 } from "./config/types.js";
 import {
   DEFAULT_MODEL,
+  KIMI_MODEL,
   MAX_PERSISTED_MESSAGES,
   MEMORY_CHAR_LIMIT,
   USER_CHAR_LIMIT,
@@ -253,6 +254,18 @@ export class ClopinetteAgent extends AIChatAgent<Env, AgentState> {
       this.sql`DELETE FROM agent_config WHERE key = 'model'`;
     }
     // If no provider, keep legacy model as-is (will be migrated on next config save)
+
+    // ── one-time: old Workers AI default → new default ──
+    // Kimi K2.6 was the only managed model for months, so every account that
+    // saved provider settings carries it as an explicit choice. Clear those
+    // rows once so DEFAULT_MODEL (Kimi K3) applies; a user who picks K2.6
+    // again afterwards keeps it (the marker prevents re-running).
+    const marker = this.sql<{ value: string }>`SELECT value FROM agent_config WHERE key = '_migrated_default_kimi_k3'`;
+    if (marker.length === 0) {
+      this.sql`DELETE FROM agent_config WHERE key IN ('model', 'model:workers-ai') AND value = ${KIMI_MODEL}`;
+      this.sql`INSERT OR REPLACE INTO agent_config (key, value, encrypted, updated_at)
+        VALUES ('_migrated_default_kimi_k3', '1', 0, datetime('now'))`;
+    }
   }
 
   async onConnect(
