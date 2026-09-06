@@ -77,6 +77,10 @@ export interface PipelineContext {
   enableCompression?: boolean;   // default: true
   enableSelfLearning?: boolean;  // default: true
   sharedMode?: boolean;          // group without owner's memory (skip MEMORY.md/USER.md)
+  /** Ephemeral turn: nothing is written to session history, FTS, Vectorize or
+   *  self-learning. Token accounting still runs. Used for group digests, whose
+   *  transcripts belong to the group, not to the owner's memory. */
+  ephemeral?: boolean;
   recentToolUse?: number;        // for smart routing (0 = no recent tools)
 
   // Performance: session-level caches (set by the DO, reused across turns)
@@ -646,7 +650,7 @@ async function runPipelineInner(
       }
       fastPrompt += `\n\n${buildCurrentContextBlock(ctx.platform)}`;
     }
-    mirrorMessage(ctx.sql, ctx.sessionId, "user", ctx.userText, undefined, undefined, buildVectorCtx(ctx));
+    if (!ctx.ephemeral) mirrorMessage(ctx.sql, ctx.sessionId, "user", ctx.userText, undefined, undefined, buildVectorCtx(ctx));
     ctx.onStateChange?.("streaming");
 
     // Fast path uses cheap model but KEEPS conversation history (like Hermes smart routing).
@@ -1017,7 +1021,7 @@ async function runPipelineInner(
       mirrorText = [mirrorText, ...markers].filter(Boolean).join("\n");
     }
   }
-  mirrorMessage(ctx.sql, ctx.sessionId, "user", mirrorText, undefined, undefined, buildVectorCtx(ctx));
+  if (!ctx.ephemeral) mirrorMessage(ctx.sql, ctx.sessionId, "user", mirrorText, undefined, undefined, buildVectorCtx(ctx));
 
   ctx.onStateChange?.("streaming");
 
@@ -1334,12 +1338,12 @@ function afterInference(
   auxiliary: { model: LanguageModel; modelId: string },
 ): void {
   // Mirror assistant response to FTS5 + Vectorize
-  if (text) {
+  if (text && !ctx.ephemeral) {
     mirrorMessage(ctx.sql, ctx.sessionId, "assistant", text, undefined, undefined, buildVectorCtx(ctx));
   }
 
   // Auto-generate session title from the first exchange (fire-and-forget)
-  if (text && ctx.userText) {
+  if (text && ctx.userText && !ctx.ephemeral) {
     const titleRows = ctx.sql<{ summary: string | null }>`
       SELECT summary FROM sessions WHERE id = ${ctx.sessionId}
     `;
@@ -1377,8 +1381,8 @@ function afterInference(
     ctx.sql`UPDATE sessions SET updated_at = datetime('now') WHERE id = ${ctx.sessionId}`;
   }
 
-  // Self-learning
-  if (ctx.enableSelfLearning !== false) {
+  // Self-learning (never on ephemeral turns — a group transcript is not the user)
+  if (ctx.enableSelfLearning !== false && !ctx.ephemeral) {
     const turnCount = incrementTurn(ctx.sql);
     if (
       turnCount >= MIN_TURNS_BEFORE_REVIEW &&
