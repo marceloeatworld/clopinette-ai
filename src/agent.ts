@@ -32,6 +32,7 @@ import type {
 import {
   DEFAULT_MODEL,
   KIMI_MODEL,
+  KIMI_K3_MODEL,
   MAX_PERSISTED_MESSAGES,
   RATE_LIMIT_PER_MINUTE,
   RATE_LIMIT_PER_HOUR,
@@ -287,6 +288,18 @@ export class ClopinetteAgent extends AIChatAgent<Env, AgentState> {
       this.sql`DELETE FROM agent_config WHERE key IN ('model', 'model:workers-ai') AND value = ${KIMI_MODEL}`;
       this.sql`INSERT OR REPLACE INTO agent_config (key, value, encrypted, updated_at)
         VALUES ('_migrated_default_kimi_k3', '1', 0, datetime('now'))`;
+    }
+
+    // ── one-time: Kimi K3 → default (K2.6) ──
+    // Kimi K3 is a partner model on Cloudflare unified billing, which is not
+    // enabled on the account: every call fails with "2021: Invalid User
+    // Credentials" (2026-09-07). Clear explicit K3 rows once so DEFAULT_MODEL
+    // (K2.6) applies; a user who re-selects K3 afterwards keeps it.
+    const k3Marker = this.sql<{ value: string }>`SELECT value FROM agent_config WHERE key = '_migrated_kimi_k3_unavailable'`;
+    if (k3Marker.length === 0) {
+      this.sql`DELETE FROM agent_config WHERE key IN ('model', 'model:workers-ai') AND value = ${KIMI_K3_MODEL}`;
+      this.sql`INSERT OR REPLACE INTO agent_config (key, value, encrypted, updated_at)
+        VALUES ('_migrated_kimi_k3_unavailable', '1', 0, datetime('now'))`;
     }
   }
 

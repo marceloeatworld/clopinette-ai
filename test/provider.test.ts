@@ -17,7 +17,7 @@ function createMockSql(rows: MockRow[]) {
 describe("loadInferenceConfig", () => {
   it("returns defaults when no config exists", async () => {
     const config = await loadInferenceConfig(createMockSql([]), TEST_KEY_B64);
-    expect(config.model).toBe("moonshotai/kimi-k3");
+    expect(config.model).toBe("@cf/moonshotai/kimi-k2.6");
     expect(config.apiKey).toBeUndefined();
     expect(config.provider).toBeUndefined();
   });
@@ -51,7 +51,7 @@ describe("loadInferenceConfig", () => {
       { key: "provider", value: "anthropic", encrypted: 0 },
     ]);
     const config = await loadInferenceConfig(sql, TEST_KEY_B64);
-    expect(config.model).toBe("moonshotai/kimi-k3");
+    expect(config.model).toBe("@cf/moonshotai/kimi-k2.6");
     expect(config.provider).toBe("anthropic");
   });
 
@@ -130,7 +130,7 @@ describe("loadInferenceConfig", () => {
       { key: "provider", value: "openai", encrypted: 0 },
     ]);
     const config = await loadInferenceConfig(sql, TEST_KEY_B64);
-    expect(config.model).toBe("moonshotai/kimi-k3");
+    expect(config.model).toBe("@cf/moonshotai/kimi-k2.6");
   });
 
   it("auxiliary defaults to platform AUXILIARY_MODEL (Gemma) for Workers AI users", async () => {

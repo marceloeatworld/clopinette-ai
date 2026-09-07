@@ -9,8 +9,12 @@ export const GLM_MODEL = "@cf/zai-org/glm-4.7-flash";
 /**
  * DEFAULT_MODEL is the user-facing Workers AI fallback when no explicit model is
  * configured. Trial/pro users start on Kimi.
+ *
+ * Kimi K3 is a partner model on Cloudflare unified billing. Until that is
+ * enabled on the account, env.AI.run("moonshotai/kimi-k3") fails with
+ * "2021: Invalid User Credentials" (verified 2026-09-07), so K2.6 stays the default.
  */
-export const DEFAULT_MODEL = KIMI_K3_MODEL;
+export const DEFAULT_MODEL = KIMI_MODEL;
 
 /**
  * AUXILIARY_MODEL is reserved for internal/background work: compression,
@@ -19,8 +23,12 @@ export const DEFAULT_MODEL = KIMI_K3_MODEL;
  */
 export const AUXILIARY_MODEL = GEMMA_MODEL;
 
-/** Workers AI models available to trial + pro plans as user-facing chat models. */
-export const WORKERS_AI_MODELS = [KIMI_MODEL, KIMI_K3_MODEL, GEMMA_MODEL, GLM_MODEL] as const;
+/**
+ * Workers AI models available to trial + pro plans as user-facing chat models.
+ * Kimi K3 is deliberately excluded (see DEFAULT_MODEL); KIMI_K3_MODEL is only
+ * kept for the one-time migration in agent.ts.
+ */
+export const WORKERS_AI_MODELS = [KIMI_MODEL, GEMMA_MODEL, GLM_MODEL] as const;
 export type WorkersAiModel = typeof WORKERS_AI_MODELS[number];
 export function isWorkersAiModel(model: string): model is WorkersAiModel {
   return (WORKERS_AI_MODELS as readonly string[]).includes(model);
