@@ -70,7 +70,39 @@ export interface DiscordInteraction {
   data?: {
     name: string;
     options?: Array<{ name: string; value: string; type: number }>;
+    /** Set on MESSAGE_COMPONENT interactions (type 3, e.g. button clicks) */
+    custom_id?: string;
   };
+}
+
+/** Buttons shown in guilds when /link is used without a mode. Click → type 3 interaction with custom_id "link:<mode>". */
+export const LINK_MODE_BUTTONS = [{
+  type: 1,
+  components: [
+    { type: 2, style: 1, label: "Trusted (full memory)", custom_id: "link:trusted" },
+    { type: 2, style: 2, label: "Shared (no private memory)", custom_id: "link:shared" },
+  ],
+}];
+
+/**
+ * Create a 5-minute link code in KV and return the message to show the user.
+ * Shared by the slash command, the mode buttons, and the bridge text command.
+ */
+export async function createLinkCode(
+  links: KVNamespace,
+  target: { isGuild: boolean; externalId: string; shared: boolean },
+): Promise<string> {
+  const code = Array.from(crypto.getRandomValues(new Uint8Array(8)))
+    .map(b => "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"[b % 36]).join("");
+  const payload = JSON.stringify({
+    platform: target.isGuild ? "dcg" : "dc",
+    externalId: target.externalId,
+    ...(target.shared && { shared: true }),
+  });
+  await links.put(`link_code:${code}`, payload, { expirationTtl: 300 });
+  const where = target.isGuild ? "this server" : "your Discord account";
+  const modeLabel = target.shared ? " (shared — no private memory)" : target.isGuild ? " (trusted — full memory)" : "";
+  return `Your link code: \`${code}\`${modeLabel}\n\nEnter this code at **clopinette.app** to link ${where}. Expires in 5 minutes.`;
 }
 
 /** Payload from bridge service */
@@ -172,7 +204,7 @@ export async function handleDiscordInteraction(
     const isGuild = !!interaction.guild_id;
     const mode = interaction.data.options?.find(o => o.name === "mode")?.value;
 
-    // In guilds, require mode choice
+    // In guilds, require mode choice — offered as buttons (handled in index.ts, type 3)
     if (isGuild && !mode) {
       return Response.json({
         type: 4,
@@ -180,32 +212,21 @@ export async function handleDiscordInteraction(
           content: [
             "**Choose a linking mode:**",
             "",
-            "`/link mode:trusted` — Family mode. Full memory, skills, and history shared with everyone in this server.",
-            "`/link mode:shared` — Public mode. Clean bot, no private memory. Good for friend groups.",
+            "**Trusted** — Family mode. Full memory, skills, and history shared with everyone in this server.",
+            "**Shared** — Public mode. Clean bot, no private memory. Good for friend groups.",
           ].join("\n"),
           flags: 64,
+          components: LINK_MODE_BUTTONS,
         },
       });
     }
 
-    const isShared = isGuild && mode === "shared";
-    const code = Array.from(crypto.getRandomValues(new Uint8Array(8)))
-      .map(b => "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"[b % 36]).join("");
-    const payload = JSON.stringify({
-      platform: isGuild ? "dcg" : "dc",
-      externalId: isGuild ? interaction.guild_id : dcUserId,
-      ...(isShared && { shared: true }),
+    const content = await createLinkCode(ctx.env.LINKS, {
+      isGuild,
+      externalId: isGuild ? interaction.guild_id! : dcUserId,
+      shared: isGuild && mode === "shared",
     });
-    await ctx.env.LINKS.put(`link_code:${code}`, payload, { expirationTtl: 300 });
-    const target = isGuild ? "this server" : "your Discord account";
-    const modeLabel = isShared ? " (shared — no private memory)" : isGuild ? " (trusted — full memory)" : "";
-    return Response.json({
-      type: 4,
-      data: {
-        content: `Your link code: \`${code}\`${modeLabel}\n\nEnter this code at **clopinette.app** to link ${target}. Expires in 5 minutes.`,
-        flags: 64,
-      },
-    });
+    return Response.json({ type: 4, data: { content, flags: 64 } });
   }
 
   // /help — ephemeral, instant
@@ -227,9 +248,7 @@ export async function handleDiscordInteraction(
           "`/note [text]` — Save or show notes",
           "`/notes` — List all notes",
           "`/reset` — New session",
-          "`/link` — Link to clopinette.app (DMs)",
-          "`/link mode:trusted` — Link server, full memory (family)",
-          "`/link mode:shared` — Link server, no memory (public)",
+          "`/link` — Link to clopinette.app (in a server: pick Trusted or Shared)",
           "",
           "**In DMs:** just type naturally — no slash command needed.",
           "",
@@ -483,18 +502,11 @@ async function handleDiscordOnlyCommand(
         ].join("\n");
       }
 
-      const isShared = isGuild && arg === "shared";
-      const code = Array.from(crypto.getRandomValues(new Uint8Array(8)))
-        .map(b => "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"[b % 36]).join("");
-      const payload = JSON.stringify({
-        platform: isGuild ? "dcg" : "dc",
-        externalId: isGuild ? guildId : discordUserId,
-        ...(isShared && { shared: true }),
+      return createLinkCode(ctx.env.LINKS, {
+        isGuild,
+        externalId: isGuild ? guildId! : discordUserId,
+        shared: isGuild && arg === "shared",
       });
-      await ctx.env.LINKS.put(`link_code:${code}`, payload, { expirationTtl: 300 });
-      const target = isGuild ? "this server" : "your Discord account";
-      const mode = isShared ? " (shared)" : isGuild ? " (trusted)" : "";
-      return `Your link code: \`${code}\`${mode}\n\nEnter this code at **clopinette.app** to link ${target}. Expires in 5 minutes.`;
     }
 
     default:

@@ -4,7 +4,7 @@ import { agentsMiddleware } from "hono-agents";
 import { authMiddleware } from "./enterprise/auth.js";
 import { registerTelegramWebhook, deleteTelegramWebhook, sendTelegramMessage } from "./gateway/telegram.js";
 import { sendWhatsAppMessage } from "./gateway/whatsapp.js";
-import { registerDiscordCommands, sendDiscordMessage } from "./gateway/discord.js";
+import { createLinkCode, registerDiscordCommands, sendDiscordMessage } from "./gateway/discord.js";
 import { timingSafeEqual } from "./enterprise/safe-compare.js";
 
 // Module-level cache for bot secret (never changes during deployment)
@@ -314,6 +314,18 @@ app.post("/webhook/discord", async (c) => {
   // PING — required for Discord endpoint verification
   if (body.type === 1) return c.json({ type: 1 });
 
+  // MESSAGE_COMPONENT (type 3) — Trusted/Shared buttons from /link in a guild.
+  // Replaces the ephemeral prompt (type 7 = UPDATE_MESSAGE) with the link code.
+  if (body.type === 3 && typeof body.data?.custom_id === "string" && body.data.custom_id.startsWith("link:")) {
+    if (!body.guild_id) return c.json({ type: 4, data: { content: "Use `/link` in a server to pick a mode.", flags: 64 } });
+    const content = await createLinkCode(c.env.LINKS, {
+      isGuild: true,
+      externalId: body.guild_id,
+      shared: body.data.custom_id === "link:shared",
+    });
+    return c.json({ type: 7, data: { content, components: [] } });
+  }
+
   // APPLICATION_COMMAND (type 2) — slash commands
   if (body.type === 2 && body.data) {
     const dcUserId = body.member?.user?.id ?? body.user?.id ?? "";
@@ -334,7 +346,7 @@ app.post("/webhook/discord", async (c) => {
         type: 4,
         data: {
           content: isGuild
-            ? "This server isn't linked to a **clopinette.app** account yet.\nUse `/link trusted` or `/link shared` to connect it."
+            ? "This server isn't linked to a **clopinette.app** account yet.\nUse `/link` and pick Trusted or Shared to connect it."
             : "Link your Discord to your **clopinette.app** account first.\nUse `/link` to get started.",
           flags: 64,
         },
