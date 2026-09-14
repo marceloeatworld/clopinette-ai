@@ -659,6 +659,7 @@ async function runPipelineInner(
     const fastMessages = ctx.messages.length > 0 ? ctx.messages.slice(-20) : [{ role: "user" as const, content: ctx.userText }];
 
     if (mode === "stream") {
+      const startedAt = Date.now();
       const result = streamText({
         abortSignal: ctx.abortSignal,
         model,
@@ -672,6 +673,7 @@ async function runPipelineInner(
           ctx.onStreamError?.(`Model error (${classification.kind}): ${msg}`);
         },
         onFinish: async ({ text, totalUsage }) => {
+          console.log(`[pipeline] inference route=simple model=${routing.model} ms=${Date.now() - startedAt}`);
           ctx.onStateChange?.("idle");
           const fastConfig = { ...config, model: routing.model };
           afterInference(ctx, fastConfig, text, totalUsage, auxiliary);
@@ -690,6 +692,7 @@ async function runPipelineInner(
     }
 
     let result: Awaited<ReturnType<typeof generateText>>;
+    const startedAt = Date.now();
     try {
       result = await generateText({
         model,
@@ -706,6 +709,7 @@ async function runPipelineInner(
       ctx.onStateChange?.("idle");
       return { error: `Model error (${classification.kind}): ${errMsg}`, status: 502 };
     }
+    console.log(`[pipeline] inference route=simple model=${routing.model} ms=${Date.now() - startedAt}`);
     const text = result.text?.trim() || NO_RESPONSE_FALLBACK;
     // Use routing.model (AUXILIARY) not config.model (primary) for correct usage attribution
     const fastConfig = { ...config, model: routing.model };
@@ -1067,6 +1071,7 @@ async function runPipelineInner(
   const onStepFinish = () => { stepCount++; };
 
   // Step 9c: LLM call with error recovery
+  const startedAt = Date.now();
   try {
     if (mode === "stream") {
       const result = streamText({
@@ -1087,6 +1092,7 @@ async function runPipelineInner(
           ctx.onStreamError?.(`Model error (${classification.kind}): ${msg}. Please retry.`);
         },
         onFinish: async ({ text, totalUsage, steps }) => {
+          console.log(`[pipeline] inference route=complex model=${config.model} steps=${steps.length} ms=${Date.now() - startedAt}`);
           ctx.onStateChange?.("idle");
           // totalUsage (sum of ALL steps), not usage (last step only) — tool turns
           // would otherwise report a fraction of their real consumption.
@@ -1120,6 +1126,7 @@ async function runPipelineInner(
       onStepFinish,
       maxRetries: 2,
     });
+    console.log(`[pipeline] inference route=complex model=${config.model} steps=${result.steps.length} ms=${Date.now() - startedAt}`);
 
     let text = result.text || "";
 

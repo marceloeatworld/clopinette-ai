@@ -47,6 +47,22 @@ describe("smart model routing", () => {
     expect(result.reason).toBe("complex");
   });
 
+  it("routes short check-ins with accents and apostrophes to auxiliary", () => {
+    for (const msg of ["te la ?", "T'es là ?!", "ça va", "ok merci", "salut ça va ?"]) {
+      const result = routeModel(msg, PRIMARY, AUXILIARY, 0);
+      expect(result.model, msg).toBe(AUXILIARY);
+      expect(result.reason, msg).toBe("simple");
+    }
+  });
+
+  it("routes short questions that need tools to primary", () => {
+    for (const msg of ["cherche la meteo", "quelle heure à Tokyo", "ok cherche ça", "hello world"]) {
+      const result = routeModel(msg, PRIMARY, AUXILIARY, 0);
+      expect(result.model, msg).toBe(PRIMARY);
+      expect(result.reason, msg).toBe("complex");
+    }
+  });
+
   it("uses caller-provided auxiliary model (BYOK case)", () => {
     const byokAuxiliary = "gpt-4o-mini";
     const result = routeModel("salut", PRIMARY, byokAuxiliary, 0);
