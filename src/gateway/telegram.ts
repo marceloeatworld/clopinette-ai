@@ -59,6 +59,8 @@ export interface TelegramContext {
   r2Memories: R2Bucket;
   /** Called when a command changes config that affects the system prompt */
   onCacheInvalidate?: () => void;
+  /** Clears the Agents SDK chat transcript (web chat history). */
+  clearChatMessages?: () => Promise<void>;
   /** Check+mark an update as processed. Returns true if already seen (duplicate webhook retry). */
   isUpdateProcessed?: (updateId: number) => boolean;
 }
@@ -233,6 +235,7 @@ export async function handleTelegramUpdate(
       r2Memories: ctx.r2Memories,
       r2Skills: ctx.env.SKILLS,
       onCacheInvalidate: ctx.onCacheInvalidate,
+      clearChatMessages: ctx.clearChatMessages,
     });
     if (sharedResult?.handled === true) {
       await sendTelegramMessage(botToken, chatId, sharedResult.text, messageId);

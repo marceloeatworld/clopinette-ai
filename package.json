@@ -11,24 +11,24 @@
     "test": "vitest run"
   },
   "dependencies": {
-    "@ai-sdk/openai": "^4.0.66",
-    "@cloudflare/ai-chat": "^0.11.0",
-    "@cloudflare/codemode": "^0.5.2",
+    "@ai-sdk/openai": "^4.0.89",
+    "@cloudflare/ai-chat": "^0.12.1",
+    "@cloudflare/codemode": "^0.5.3",
     "@cloudflare/playwright-mcp": "^0.0.5",
-    "agents": "^0.22.0",
-    "ai": "^7.0.99",
+    "agents": "^0.27.0",
+    "ai": "^7.0.133",
     "fflate": "^0.8.3",
-    "hono": "^4.13.7",
+    "hono": "^4.13.13",
     "hono-agents": "^3.0.12",
-    "mammoth": "^1.12.3",
+    "mammoth": "^1.13.0",
     "unpdf": "^1.8.1",
     "workers-ai-provider": "^4.0.0",
     "zod": "^4.6.5"
   },
   "devDependencies": {
-    "@cloudflare/workers-types": "^5.20260914.1",
+    "@cloudflare/workers-types": "^5.20261008.1",
     "typescript": "^7.0.2",
-    "vitest": "^5.0.0",
-    "wrangler": "^4.131.2"
+    "vitest": "^5.0.3",
+    "wrangler": "^4.148.0"
   }
 }

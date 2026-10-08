@@ -279,7 +279,7 @@ BASE_URL=https://your-worker.workers.dev API_KEY=xxx bun test/live/smoke.ts
 
 ## Tech stack
 
-Cloudflare Workers, Durable Objects, Workflows, Queues, Vectorize, Workers AI, AI Gateway, KV, R2, Browser Run, AutoRAG. TypeScript 7 + [Hono](https://hono.dev) + [Agents SDK](https://github.com/cloudflare/agents) 0.22 + [AI SDK v7](https://ai-sdk.dev).
+Cloudflare Workers, Durable Objects, Workflows, Queues, Vectorize, Workers AI, AI Gateway, KV, R2, Browser Run, AutoRAG. TypeScript 7 + [Hono](https://hono.dev) + [Agents SDK](https://github.com/cloudflare/agents) 0.27 + [AI SDK v7](https://ai-sdk.dev).
 
 ## License
 

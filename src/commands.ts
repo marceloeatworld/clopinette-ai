@@ -22,6 +22,8 @@ export interface CommandContext {
   r2Skills?: R2Bucket;
   /** Called when a command changes config that affects the system prompt (e.g. /personality, /reset). */
   onCacheInvalidate?: () => void;
+  /** Clears the Agents SDK chat transcript (this.messages). Managed by the SDK since agents 0.23. */
+  clearChatMessages?: () => Promise<void>;
 }
 
 export interface CommandResult {
@@ -58,7 +60,7 @@ export async function handleCommand(
     case "/clear":
     case "/reset":
       ctx.sql`DELETE FROM session_messages WHERE session_id = ${ctx.sessionId}`;
-      ctx.sql`DELETE FROM cf_ai_chat_agent_messages`;
+      await ctx.clearChatMessages?.();
       ctx.sql`DELETE FROM agent_config WHERE key = 'personality'`;
       // Make "All pending research purged" true — orphaned queued/running rows would
       // otherwise keep blocking the last-delegate auto-resume for this session.
@@ -207,7 +209,7 @@ export async function handleCommand(
       ctx.sql`INSERT OR REPLACE INTO agent_config (key, value, encrypted, updated_at)
         VALUES ('soul_md', ${DEFAULT_SOUL_MD}, 0, datetime('now'))`;
       // Wipe Agents SDK message persistence (this.messages)
-      ctx.sql`DELETE FROM cf_ai_chat_agent_messages`;
+      await ctx.clearChatMessages?.();
       ctx.onCacheInvalidate?.();
 
       // R2 wipe (docs, audio, images, skills, spillovers).

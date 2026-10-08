@@ -75,6 +75,8 @@ export interface WhatsAppContext {
   r2Memories: R2Bucket;
   /** Called when a command changes config that affects the system prompt */
   onCacheInvalidate?: () => void;
+  /** Clears the Agents SDK chat transcript (web chat history). */
+  clearChatMessages?: () => Promise<void>;
 }
 
 // ───────────────────────── Webhook Handler ─────────────────────────
@@ -111,6 +113,7 @@ export async function handleWhatsAppUpdate(
       r2Memories: ctx.r2Memories,
       r2Skills: ctx.env.SKILLS,
       onCacheInvalidate: ctx.onCacheInvalidate,
+      clearChatMessages: ctx.clearChatMessages,
     });
     if (sharedResult?.handled === true) {
       await sendWhatsAppMessage(ctx.accessToken, ctx.phoneNumberId, from, sharedResult.text);

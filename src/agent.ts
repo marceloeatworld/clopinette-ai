@@ -382,6 +382,7 @@ export class ClopinetteAgent extends AIChatAgent<Env, AgentState> {
           this.#cachedSystemPrompts.clear();
           this.#cachedInferenceConfig = null;
         },
+        clearChatMessages: () => this.sessions.session().clearMessages(),
         isUpdateProcessed: (id) => {
           if (this.#processedUpdateIds.has(id)) return true;
           this.#processedUpdateIds.add(id);
@@ -418,6 +419,7 @@ export class ClopinetteAgent extends AIChatAgent<Env, AgentState> {
           this.#cachedSystemPrompts.clear();
           this.#cachedInferenceConfig = null;
         },
+        clearChatMessages: () => this.sessions.session().clearMessages(),
       }).catch(err => console.error("[whatsapp] handler error:", err)));
       return new Response("ok");
     }
@@ -442,6 +444,7 @@ export class ClopinetteAgent extends AIChatAgent<Env, AgentState> {
           this.#cachedSystemPrompts.clear();
           this.#cachedInferenceConfig = null;
         },
+        clearChatMessages: () => this.sessions.session().clearMessages(),
         isDigestChat: (chatJid) => this.#isDigestChat(chatJid),
         ingestGroupMessage: (chatJid, author, content) => {
           this.sql`INSERT INTO group_messages (chat_jid, author, content) VALUES (${chatJid}, ${author}, ${content})`;
@@ -473,6 +476,7 @@ export class ClopinetteAgent extends AIChatAgent<Env, AgentState> {
           this.#cachedSystemPrompts.clear();
           this.#cachedInferenceConfig = null;
         },
+        clearChatMessages: () => this.sessions.session().clearMessages(),
       };
 
       if (source === "interaction") {
@@ -561,6 +565,7 @@ export class ClopinetteAgent extends AIChatAgent<Env, AgentState> {
         this.#cachedSystemPrompts.clear();
         this.#cachedInferenceConfig = null;
       },
+      clearChatMessages: () => this.sessions.session().clearMessages(),
     });
     if (cmdResult?.handled === true) {
       // Send directly over WS — HTTP Responses from onChatMessage are not
@@ -756,6 +761,7 @@ export class ClopinetteAgent extends AIChatAgent<Env, AgentState> {
         this.#cachedSystemPrompts.clear();
         this.#cachedInferenceConfig = null;
       },
+      clearChatMessages: () => this.sessions.session().clearMessages(),
     });
     if (cmdResult?.handled === true) return { text: cmdResult.text };
     if (cmdResult?.handled === false) {
@@ -1418,7 +1424,7 @@ export class ClopinetteAgent extends AIChatAgent<Env, AgentState> {
     try { this.sql`DELETE FROM pending_delegates`; } catch { /* */ }
     this.sql`UPDATE prompt_memory SET content = '', updated_at = datetime('now')`;
     this.sql`DELETE FROM agent_config`;
-    this.sql`DELETE FROM cf_ai_chat_agent_messages`;
+    await this.sessions.session().clearMessages();
     const safeId = this.#userId.replace(/[^a-zA-Z0-9_-]/g, "");
     if (safeId) {
       try {
@@ -2320,7 +2326,7 @@ export class ClopinetteAgent extends AIChatAgent<Env, AgentState> {
     // 3. Clear SDK messages — websocket only. The SDK message table backs the web
     // chat exclusively; a Telegram/WhatsApp idle reset must not wipe the web history.
     if (platform === "websocket") {
-      this.sql`DELETE FROM cf_ai_chat_agent_messages`;
+      await this.sessions.session().clearMessages();
     }
 
     // 4. Reset turn counter + prune old audit entries

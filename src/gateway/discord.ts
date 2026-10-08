@@ -127,6 +127,8 @@ export interface DiscordContext {
   runPrompt: (text: string, media?: MediaAsset[], onToolProgress?: (toolName: string, preview: string) => void, chatId?: string) => Promise<{ text: string; mediaDelivery?: MediaDelivery[] } | { error: string }>;
   r2Memories: R2Bucket;
   onCacheInvalidate?: () => void;
+  /** Clears the Agents SDK chat transcript (web chat history). */
+  clearChatMessages?: () => Promise<void>;
 }
 
 // ───────────────────────── Slash Command Registration ─────────────────────────
@@ -310,6 +312,7 @@ export async function processInteractionDeferred(
     r2Memories: ctx.r2Memories,
     r2Skills: ctx.env.SKILLS,
     onCacheInvalidate: ctx.onCacheInvalidate,
+      clearChatMessages: ctx.clearChatMessages,
   });
 
   if (sharedResult?.handled === false) {
@@ -351,6 +354,7 @@ export async function handleDiscordMessage(
       r2Memories: ctx.r2Memories,
       r2Skills: ctx.env.SKILLS,
       onCacheInvalidate: ctx.onCacheInvalidate,
+      clearChatMessages: ctx.clearChatMessages,
     });
     if (sharedResult?.handled === true) {
       await sendDiscordMessage(ctx.botToken, channelId, sharedResult.text);

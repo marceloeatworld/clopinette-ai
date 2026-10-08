@@ -55,6 +55,8 @@ export interface EvolutionContext {
   runPrompt: (text: string, media?: MediaAsset[], onToolProgress?: (toolName: string, preview: string) => void, chatId?: string) => Promise<{ text: string; mediaDelivery?: MediaDelivery[] } | { error: string }>;
   r2Memories: R2Bucket;
   onCacheInvalidate?: () => void;
+  /** Clears the Agents SDK chat transcript (web chat history). */
+  clearChatMessages?: () => Promise<void>;
   /** True when digest mode is enabled for this group chat (silent collection). */
   isDigestChat: (chatJid: string) => boolean;
   /** Store a group message for the next digest (no pipeline run, no reply). */
@@ -139,6 +141,7 @@ export async function handleEvolutionUpdate(
       r2Memories: ctx.r2Memories,
       r2Skills: ctx.env.SKILLS,
       onCacheInvalidate: ctx.onCacheInvalidate,
+      clearChatMessages: ctx.clearChatMessages,
     });
     if (sharedResult?.handled === true) {
       await sendEvolutionMessage(ctx.apiUrl, ctx.apiKey, ctx.instanceName, remoteJid, sharedResult.text);
