@@ -2368,8 +2368,14 @@ export class ClopinetteAgent extends AIChatAgent<Env, AgentState> {
 
     // 3. Clear SDK messages — websocket only. The SDK message table backs the web
     // chat exclusively; a Telegram/WhatsApp idle reset must not wipe the web history.
+    // The SDK persists the incoming user message before onChatMessage runs, and
+    // this.messages mirrors storage, so clearMessages() would also drop the
+    // message that triggered this reset and the turn would run with an empty
+    // prompt ("messages must not be empty"). Keep that message.
     if (platform === "websocket") {
+      const current = this.messages[this.messages.length - 1];
       await this.sessions.session().clearMessages();
+      if (current?.role === "user") await this.persistMessages([current]);
     }
 
     // 4. Reset turn counter + prune old audit entries
