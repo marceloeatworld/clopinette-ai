@@ -163,6 +163,26 @@ export interface StatusResponse {
 
 // ───────────────────────── Admin types ─────────────────────────
 
+/** Aggregate footprint of one agent DO, read by the gateway owner console. */
+export interface AdminStats {
+  sessions: number;
+  messages: number;
+  lastMessageAt: string | null;
+  platforms: Array<{ platform: string; sessions: number; lastActive: string | null; tokens: number }>;
+  /** DO-side counter (`monthly_tokens`) for the current month, to compare with D1 usage_events. */
+  tokensThisMonth: number;
+  memory: Record<string, { chars: number; updatedAt: string | null }>;
+  notes: number;
+  openTodos: number;
+  calendarEvents: number;
+  skills: number;
+  hubInstalled: number;
+  cronJobs: number;
+  pendingDelegates: number;
+  provider: string | null;
+  currentModel: string;
+}
+
 export interface AuditRow {
   id: number;
   action: string;

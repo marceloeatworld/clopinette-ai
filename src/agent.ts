@@ -28,6 +28,7 @@ import type {
   SessionRow,
   SessionMessageRow,
   StatusResponse,
+  AdminStats,
 } from "./config/types.js";
 import {
   DEFAULT_MODEL,
@@ -1403,6 +1404,48 @@ export class ClopinetteAgent extends AIChatAgent<Env, AgentState> {
     if (exists.length === 0) throw new Error("Event not found");
     this.sql`DELETE FROM calendar_events WHERE id = ${eventId}`;
     return { ok: true };
+  }
+
+  // ───────────────────────── Owner console stats (RPC @callable) ─────────────────────────
+
+  /**
+   * Read-only snapshot of this agent's data footprint for the owner console.
+   * Aggregates only (no message content), so it is safe to show next to the
+   * D1 billing data and cheap on a cold DO.
+   */
+  @callable()
+  async getAdminStats(): Promise<AdminStats> {
+    const count = (rows: Array<{ cnt: number }>) => rows[0]?.cnt ?? 0;
+    const month = new Date().toISOString().slice(0, 7);
+    const platforms = this.sql<{ platform: string | null; sessions: number; last_active: string | null; tokens: number }>`
+      SELECT platform, COUNT(*) as sessions, MAX(updated_at) as last_active, COALESCE(SUM(total_tokens), 0) as tokens
+      FROM sessions GROUP BY platform ORDER BY last_active DESC
+    `;
+    const memory = this.sql<{ type: string; chars: number; updated_at: string | null }>`
+      SELECT type, LENGTH(content) as chars, updated_at FROM prompt_memory
+    `;
+    const monthly = this.sql<{ total: number }>`SELECT total FROM monthly_tokens WHERE month = ${month}`;
+    // todos is created lazily by the todo tool; it may not exist yet
+    let todos = 0;
+    try { todos = count(this.sql<{ cnt: number }>`SELECT COUNT(*) as cnt FROM todos WHERE done = 0`); } catch { /* no table */ }
+    const lastMessage = this.sql<{ at: string | null }>`SELECT MAX(created_at) as at FROM session_messages`;
+    return {
+      sessions: count(this.sql<{ cnt: number }>`SELECT COUNT(*) as cnt FROM sessions`),
+      messages: count(this.sql<{ cnt: number }>`SELECT COUNT(*) as cnt FROM session_messages`),
+      lastMessageAt: lastMessage[0]?.at ?? null,
+      platforms: platforms.map((r) => ({ platform: r.platform ?? "api", sessions: r.sessions, lastActive: r.last_active, tokens: r.tokens })),
+      tokensThisMonth: monthly[0]?.total ?? 0,
+      memory: Object.fromEntries(memory.map((m) => [m.type, { chars: m.chars, updatedAt: m.updated_at }])),
+      notes: count(this.sql<{ cnt: number }>`SELECT COUNT(*) as cnt FROM notes`),
+      openTodos: todos,
+      calendarEvents: count(this.sql<{ cnt: number }>`SELECT COUNT(*) as cnt FROM calendar_events`),
+      skills: count(this.sql<{ cnt: number }>`SELECT COUNT(*) as cnt FROM skills`),
+      hubInstalled: count(this.sql<{ cnt: number }>`SELECT COUNT(*) as cnt FROM hub_installed`),
+      cronJobs: count(this.sql<{ cnt: number }>`SELECT COUNT(*) as cnt FROM cron_jobs`),
+      pendingDelegates: count(this.sql<{ cnt: number }>`SELECT COUNT(*) as cnt FROM pending_delegates WHERE status IN ('queued', 'running')`),
+      provider: this.sql<{ value: string }>`SELECT value FROM agent_config WHERE key = 'provider'`[0]?.value ?? null,
+      currentModel: this.state.currentModel,
+    };
   }
 
   // ───────────────────────── Wipe account (RPC @callable) ─────────────────────────
