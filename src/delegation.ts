@@ -7,6 +7,8 @@ export interface DelegateToolsetContext {
   auxModel?: LanguageModel;
   searxngUrl?: string;
   braveApiKey?: string;
+  parallelSearchEnabled?: boolean;
+  sessionId?: string;
 }
 
 export function buildDelegateTools(ctx: DelegateToolsetContext) {
@@ -17,6 +19,7 @@ export function buildDelegateTools(ctx: DelegateToolsetContext) {
       ctx.auxModel,
       ctx.searxngUrl,
       ctx.braveApiKey,
+      { enabled: ctx.parallelSearchEnabled, sessionId: ctx.sessionId },
     ),
   };
 }

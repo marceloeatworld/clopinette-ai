@@ -275,7 +275,7 @@ function incrementTurn(sql: SqlFn): number {
 
 // ───────────────────────── Tool Enhancements (Hermes-style) ─────────────────────────
 
-type ToolLike = { description: string; inputSchema: unknown; execute: (args: unknown) => Promise<unknown> };
+type ToolLike = { description: string; inputSchema: unknown; execute: (args: unknown, options?: { abortSignal?: AbortSignal }) => Promise<unknown> };
 
 /** Per-result spillover threshold: results larger than this land in R2. */
 const SPILL_THRESHOLD_BYTES = 20_000;
@@ -391,7 +391,7 @@ function enhanceTools(
       const t = tool as ToolLike;
       return [name, {
         ...t,
-        execute: async (args: unknown) => {
+        execute: async (args: unknown, options?: { abortSignal?: AbortSignal }) => {
           // Dedup: same tool+args within 2s → return cached
           const dedupKey = `${name}:${JSON.stringify(args)}`;
           const cached = dedupCache.get(dedupKey);
@@ -406,7 +406,8 @@ function enhanceTools(
             onToolProgress(name, String(preview).slice(0, 80));
           }
 
-          let result = await t.execute(args);
+          options?.abortSignal?.throwIfAborted();
+          let result = await t.execute(args, options);
 
           // Spill oversized results to R2 before caching / returning
           if (spillCtx) {

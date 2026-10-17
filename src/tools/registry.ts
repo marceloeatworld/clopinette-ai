@@ -84,7 +84,10 @@ export function buildTools(ctx: ToolContext) {
   const historyTool = createSessionSearchTool(ctx);
   const docsTool = createDocsTool(ctx);
   const notesTool = createNoteTool(ctx);
-  const webTool = createWebTool(ctx.cfAccountId, ctx.cfBrowserToken, ctx.auxModel, ctx.searxngUrl, ctx.braveApiKey);
+  const webTool = createWebTool(ctx.cfAccountId, ctx.cfBrowserToken, ctx.auxModel, ctx.searxngUrl, ctx.braveApiKey, {
+    enabled: (ctx.env as Env).PARALLEL_SEARCH_ENABLED !== "false",
+    sessionId: ctx.sessionId,
+  });
   const ttsTool = createTtsTool(ctx.ai, ctx.r2Memories, ctx.userId, createUsageTracker(ctx), ctx.plan, ctx.byokMedia);
   const imageTool = createImageGenTool(ctx.ai, ctx.r2Memories, ctx.userId, createUsageTracker(ctx), ctx.plan, ctx.byokMedia);
 
