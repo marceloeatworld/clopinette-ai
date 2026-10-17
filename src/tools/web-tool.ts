@@ -1,14 +1,16 @@
 import { z } from "zod";
 import { generateText } from "ai";
 import type { LanguageModel } from "ai";
+import { callParallel } from "./parallel-search.js";
 
 /**
- * Unified web tool — 100% Cloudflare-native.
+ * Unified web tool for Cloudflare Workers, with keyless Parallel search/read.
  *
  * Replaces: web-search-tool.ts (Brave/Tavily), web-browse-tool.ts, web-crawl-tool.ts.
  *
- * All powered by CF Browser Rendering REST API:
- * - search:      /json endpoint on DuckDuckGo HTML → AI extracts structured results
+ * Configured search backends retain their existing fallback chain.
+ * Unconfigured search and read without a browser token use Parallel Search MCP.
+ * Browser operations use CF Browser Rendering REST API:
  * - read:        /markdown endpoint → page as markdown, auto-summarized if long
  * - extract:     /json endpoint → AI-powered structured data extraction
  * - scrape:      /scrape endpoint → CSS selector extraction
@@ -75,15 +77,27 @@ function createSemaphore(max: number) {
   let active = 0;
   const queue: Array<() => void> = [];
   return {
-    async acquire(): Promise<void> {
+    async acquire(signal?: AbortSignal): Promise<void> {
+      signal?.throwIfAborted();
       if (active < max) { active++; return; }
-      await new Promise<void>((resolve) => queue.push(resolve));
-      active++;
+      await new Promise<void>((resolve, reject) => {
+        const ready = () => {
+          signal?.removeEventListener("abort", cancelled);
+          resolve();
+        };
+        const cancelled = () => {
+          const index = queue.indexOf(ready);
+          if (index >= 0) queue.splice(index, 1);
+          reject(signal?.reason);
+        };
+        queue.push(ready);
+        signal?.addEventListener("abort", cancelled, { once: true });
+      });
     },
     release(): void {
-      active--;
       const next = queue.shift();
-      if (next) next();
+      // Transfer the occupied slot directly to a waiter.
+      if (next) next(); else active--;
     },
   };
 }
@@ -292,10 +306,12 @@ export function createWebTool(
   auxModel?: LanguageModel,
   searxngUrl?: string,
   braveApiKey?: string,
+  parallel: { enabled?: boolean; sessionId?: string; abortSignal?: AbortSignal } = {},
 ) {
   // Unique session ID per tool instance — prevents Browser Rendering deadlock when
   // delegates + parent share the same accountId but need separate Chromium sessions.
   const sessionId = `clop-${accountId.slice(0, 8)}-${Math.random().toString(36).slice(2, 8)}`;
+  const parallelSessionId = parallel.sessionId?.slice(0, 100) || crypto.randomUUID();
 
   // Max 2 concurrent executions per tool instance — prevents "stalled HTTP response"
   // deadlocks when the LLM emits 4+ web tool calls in the same step.
@@ -306,7 +322,7 @@ export function createWebTool(
       "Web tool: search the web and read URLs. Also supports structured extraction, scraping, and crawling.\n\n" +
       "Actions:\n" +
       "- 'search': search the web. Returns up to 10 results with titles, URLs, and descriptions.\n" +
-      "- 'read': read a URL as markdown. Pages under 5000 chars return full content; larger pages are LLM-summarized. Also works with PDF URLs.\n" +
+      "- 'read': read a URL as markdown. Without a browser token, Parallel returns up to 5000 chars. Browser-backed larger pages are LLM-summarized. Also works with PDF URLs.\n" +
       "- 'extract': AI-powered structured data extraction (pass prompt and/or JSON schema).\n" +
       "- 'scrape': targeted CSS selector extraction.\n" +
       "- 'links': list all links on a page.\n" +
@@ -321,7 +337,7 @@ export function createWebTool(
       url: z.string().optional().describe("URL (for read/extract/scrape/links/crawl_start)"),
       count: z.coerce.number().optional().default(5).describe("Number of search results (default 5, max 10)"),
       engine: z.string().optional()
-        .describe("Ignored — search uses automatic fallback chain (SearXNG → Brave API → Browser Rendering)."),
+        .describe("Use 'parallel' for keyless search/read. Otherwise search uses configured SearXNG → Brave API → Browser Rendering, or Parallel when none is configured."),
       prompt: z.string().optional().describe("For 'extract': what data to extract"),
       schema: z.string().optional().describe("For 'extract': JSON schema string for structured output"),
       selector: z.string().optional().describe("For 'scrape': CSS selector (e.g. 'article', '.content', 'table')"),
@@ -349,7 +365,7 @@ export function createWebTool(
       staticOnly?: boolean;
       includePattern?: string;
       excludePattern?: string;
-    }) => {
+    }, options?: { abortSignal?: AbortSignal }) => {
       if (params.action === "diagnostics") {
         const diagnostics = buildQuickActionDiagnostics(
           sessionId,
@@ -369,16 +385,29 @@ export function createWebTool(
         };
       }
 
+      const useParallel = (params.action === "search" && (params.engine === "parallel" || (!browserToken && !searxngUrl && !braveApiKey)))
+        || (params.action === "read" && (params.engine === "parallel" || !browserToken));
+      if (useParallel) {
+        if (parallel.enabled === false) return { ok: false, error: "Parallel search/read is disabled by the operator." };
+        const value = params.action === "search" ? params.query : params.url;
+        if (!value?.trim()) return { ok: false, error: `${params.action === "search" ? "query" : "url"} required for ${params.action}` };
+        if (params.action === "read") {
+          try {
+            const url = new URL(value);
+            if (!["http:", "https:"].includes(url.protocol) || url.username || url.password) throw new Error("invalid URL");
+          } catch { return { ok: false, error: "A valid HTTP or HTTPS URL without credentials is required." }; }
+        }
+        const count = Math.max(1, Math.min(10, Math.floor(params.count ?? 5) || 5));
+        const signal = options?.abortSignal ?? parallel.abortSignal;
+        await sem.acquire(signal);
+        try {
+          return await callParallel(params.action as "search" | "read", value, parallelSessionId, count, signal);
+        } finally { sem.release(); }
+      }
+
       const needsBrowserRun = params.action !== "search";
       if (needsBrowserRun && !browserToken) {
         return { ok: false, error: "Browser not configured. Set CF_BROWSER_TOKEN secret." };
-      }
-
-      if (params.action === "search" && !browserToken && !searxngUrl && !braveApiKey) {
-        return {
-          ok: false,
-          error: "Search not configured. Set one of: SEARXNG_URL, BRAVE_API_KEY, or CF_BROWSER_TOKEN.",
-        };
       }
 
       await sem.acquire();

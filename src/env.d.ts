@@ -61,4 +61,6 @@ interface Env {
   // Search backends (SearXNG primary, Brave API fallback, Browser Rendering last resort)
   SEARXNG_URL?: string;
   BRAVE_API_KEY?: string;
+  // Set to "false" to disable anonymous Parallel search/read (including explicit engine selection).
+  PARALLEL_SEARCH_ENABLED?: string;
 }

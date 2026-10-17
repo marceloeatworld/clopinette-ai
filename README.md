@@ -52,7 +52,7 @@ Primary tools available to the agent:
 
 | Tool | What it does |
 |---|---|
-| `web` | Search, read URL, scrape, extract, crawl, diagnostics (SearXNG / Brave / Browser Run quick actions) |
+| `web` | Search, read URL, scrape, extract, crawl, diagnostics (Parallel / SearXNG / Brave / Browser Run quick actions) |
 | `docs` | RAG search + Q&A over user-uploaded documents (AutoRAG) |
 | `history` | Hybrid keyword + semantic search across past conversations |
 | `memory` | Read / write persistent `MEMORY.md` and `USER.md` |
@@ -67,6 +67,26 @@ Primary tools available to the agent:
 | `delegate` | Run parallel web-only research sub-agents in the background — conditional |
 
 With codemode active (when the `LOADER` binding is set), the LLM writes JavaScript that orchestrates internal state tools in one step instead of spending tokens on repetitive tool chatter.
+
+### Web search without credentials
+
+Fresh installations use [Parallel Search MCP](https://docs.parallel.ai/integrations/mcp/search-mcp)
+for free web search, powered by Fast mode, with no account or API key. The `web`
+tool and research delegates use `https://search.parallel.ai/mcp`. Search queries
+and requested page URLs are sent to Parallel; service rate limits apply.
+
+Configured search retains its existing SearXNG → Brave API → Browser Run order.
+Parallel is selected automatically only when none of those credentials is set;
+a configured provider failure does not switch to Parallel. Set `engine: "parallel"`
+on a `search` or `read` call to select it explicitly. Without `CF_BROWSER_TOKEN`,
+`read` uses Parallel and returns up to 5000 characters of page text. With a browser
+token, reads retain Browser Run and optional LLM summarization. Extraction,
+scraping, links and crawling still require the browser token.
+
+Set `PARALLEL_SEARCH_ENABLED` to `"false"` in Wrangler `vars` to disable Parallel
+search and reads, including explicit selection. Each MCP operation has a 15 second
+deadline, and cancelled turns abort in-flight requests. Failed operations return
+an error without switching providers.
 
 ### Skills Hub
 
@@ -219,7 +239,8 @@ Slash commands (`/ask`, `/status`, `/memory`, etc.) work immediately. The bridge
 ### Optional secrets
 
 ```bash
-# Web search backends (automatic fallback: SearXNG → Brave → Browser Run)
+# Optional search backends (configured fallback: SearXNG → Brave → Browser Run)
+# No search secrets: Parallel Search MCP is used automatically.
 wrangler secret put SEARXNG_URL          # self-hosted SearXNG URL
 wrangler secret put BRAVE_API_KEY        # free tier: 2000 queries/month
 wrangler secret put CF_BROWSER_TOKEN     # last resort + read/extract/crawl
@@ -275,6 +296,8 @@ test/                   Unit tests + live smoke test
 bun run check    # TypeScript
 bun run test     # Unit tests (vitest)
 BASE_URL=https://your-worker.workers.dev API_KEY=xxx bun test/live/smoke.ts
+# Optional live anonymous Parallel transport check (uses the service's free quota)
+RUN_PARALLEL_LIVE=1 bun run test test/live/parallel-search.test.ts
 ```
 
 ## Tech stack

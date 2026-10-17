@@ -162,6 +162,8 @@ export class DelegateWorkflow extends WorkflowEntrypoint<Env, DelegateWorkflowPa
         auxModel: auxiliary.model,
         searxngUrl: this.env.SEARXNG_URL,
         braveApiKey: this.env.BRAVE_API_KEY,
+        parallelSearchEnabled: this.env.PARALLEL_SEARCH_ENABLED !== "false",
+        sessionId,
       });
 
       // Dedup + trace wrapper
@@ -169,10 +171,10 @@ export class DelegateWorkflow extends WorkflowEntrypoint<Env, DelegateWorkflowPa
       let stepCount = 0;
       const tracedTools = Object.fromEntries(
         Object.entries(tools).map(([name, tool]) => {
-          const t = tool as { description: string; inputSchema: unknown; execute: (args: unknown) => Promise<unknown> };
+          const t = tool as { description: string; inputSchema: unknown; execute: (args: unknown, options?: { abortSignal?: AbortSignal }) => Promise<unknown> };
           return [name, {
             ...t,
-            execute: async (args: unknown) => {
+            execute: async (args: unknown, options?: { abortSignal?: AbortSignal }) => {
               const preview = (args as Record<string, unknown>)?.query
                 ?? (args as Record<string, unknown>)?.action ?? "";
               toolTrace.push(`${name}(${String(preview).slice(0, 60)})`);
@@ -181,7 +183,8 @@ export class DelegateWorkflow extends WorkflowEntrypoint<Env, DelegateWorkflowPa
               const cached = dedupCache.get(dedupKey);
               if (cached && Date.now() - cached.ts < 2000) return cached.result;
 
-              const result = await t.execute(args);
+              options?.abortSignal?.throwIfAborted();
+              const result = await t.execute(args, options);
               dedupCache.set(dedupKey, { result, ts: Date.now() });
               stepCount++;
 

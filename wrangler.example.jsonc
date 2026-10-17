@@ -109,6 +109,8 @@
   //                         live smoke test
   //
   // Optional:
+  // No search secrets: Parallel Search MCP provides anonymous search and read.
+  // To disable it, add "PARALLEL_SEARCH_ENABLED": "false" to vars.
   //   GATEWAY_URL            — Gateway worker URL, used to refresh a stale quota cache
   //   GATEWAY_INTERNAL_KEY   — Secret for /internal/* calls (falls back to WS_SIGNING_SECRET)
   //   SEARXNG_URL            — Self-hosted SearXNG (first web search backend)
